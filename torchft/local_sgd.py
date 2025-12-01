@@ -14,10 +14,16 @@ import math
 import os
 from contextlib import nullcontext
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type, Callable
 
 import torch
 from torch import nn, optim
+import torch.distributed as dist
+from torch.distributed.checkpoint.state_dict import (
+    get_optimizer_state_dict,
+    set_optimizer_state_dict,
+    StateDictOptions
+)
 from torch.distributed.distributed_c10d import Work
 from torch.distributed.tensor import DTensor
 from torch.utils.hooks import RemovableHandle
@@ -251,6 +257,9 @@ class _StreamingDiLoCoFragment:
             ):
                 t = t.pin_memory()
             self.original_parameters[name] = t
+        
+        if self._manager._rank0_synchronization_only:
+            self._gloo_group_pg = self._manager._gloo_group_pg
 
     def register_state_dict_fn(self) -> None:
         """
@@ -261,6 +270,13 @@ class _StreamingDiLoCoFragment:
             manager: The manager to register with
             fragment_id: Optional identifier for this fragment, used in the key
         """
+        if self._manager._rank0_synchronization_only:
+            self._register_state_dict_fn_rank0()
+        else:
+            self._register_state_dict_fn_all_ranks()
+    
+    def _register_state_dict_fn_all_ranks(self) -> None:
+
         # Generate a unique key for this fragment based on the model fragment's name or provided ID
         fragment_key = f"StreamingDiLoCoFragment_{self._fragment_id}"
 
@@ -281,6 +297,60 @@ class _StreamingDiLoCoFragment:
                     for name, param in self.original_parameters.items()
                 },
             }
+
+        # Register the functions with the manager
+        self._manager.register_state_dict_fn(fragment_key, load_fn, save_fn)
+
+    def _register_state_dict_fn_rank0(self) -> None:
+        # Generate a unique key for this fragment based on the model fragment's name or provided ID
+        fragment_key = f"StreamingDiLoCoFragment_{self._fragment_id}"
+
+        state_dict_options = StateDictOptions(full_state_dict=True)
+
+        # Define load function for this fragment
+        def load_fn(state_dict: Dict[str, Dict[str, torch.Tensor]]) -> None:
+            for name, global_tensor in state_dict["original_parameters"].items():
+                if name in self.original_parameters:
+                    width = self.original_parameters[name].shape[0]
+                    start = self._manager._group_rank * width
+                    end = start + width
+                    self.original_parameters[name].copy_(global_tensor[start:end, ...])
+            
+            # call step() to initialize the outer optimizer correctly before setting its state dict
+            self._outer_optimizer.step()
+            set_optimizer_state_dict(
+                self._model_fragment,
+                self._outer_optimizer,
+                state_dict["outer_optimizer"],
+                options=state_dict_options
+            )
+
+        # Define save function for this fragment
+        def save_fn() -> Dict[str, Dict[str, torch.Tensor]]:
+            if self._manager._group_rank == 0:
+                state_dict = {}
+                state_dict["outer_optimizer"] = get_optimizer_state_dict(
+                    self._model_fragment,
+                    self._outer_optimizer,
+                    options=state_dict_options
+                )
+                state_dict["original_parameters"] = {}
+                for name, local_tensor in self.original_parameters.items():
+                    local_tensors = [torch.empty_like(local_tensor) for _ in range(self._manager._group_world_size)]
+                    dist.gather(local_tensor, local_tensors, dst=0, group=self._gloo_group_pg)
+                    state_dict["original_parameters"][name] = torch.cat(local_tensors)
+                return state_dict
+            else:
+                # call get_optimizer_state_dict to gather outer optimizer state dict at rank 0
+                get_optimizer_state_dict(
+                    self._model_fragment,
+                    self._outer_optimizer,
+                    options=state_dict_options
+                )
+                for name, local_tensor in self.original_parameters.items():
+                    dist.gather(local_tensor, None, dst=0, group=self._gloo_group_pg)
+                return {}
+            
 
         # Register the functions with the manager
         self._manager.register_state_dict_fn(fragment_key, load_fn, save_fn)
@@ -441,7 +511,9 @@ class _StreamingDiLoCoFragment:
                 self._stop_event.record()
 
         self.wait()
-
+        # scatter pseudogradients locally from rank 0
+        if self._manager._rank0_synchronization_only:
+            self._manager.scatter_grads()
         # save the parameters so they can be used for merging
         self._save_local_parameters()
         # Restore the parameters back to the previous state

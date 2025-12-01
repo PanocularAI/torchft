@@ -55,6 +55,7 @@ from torch.distributed import ReduceOp, TCPStore
 from torch.distributed.distributed_c10d import AllreduceOptions, ReduceOp, Work
 from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
+from torchft.checkpointing.pg_transport import PGTransport
 from torchft.checkpointing._rwlock import RWLock
 from torchft.futures import future_timeout
 from torchft.utils import get_stream_context, synchronize
@@ -177,12 +178,14 @@ class Manager:
         lighthouse_addr: Optional[str] = None,
         replica_id: Optional[str] = None,
         port: Optional[int] = None,
-        hostname: str = socket.gethostname(),
+        hostname: Optional[str] = None,
         heartbeat_interval: timedelta = timedelta(milliseconds=100),
         checkpoint_transport: Optional[CheckpointTransport[Dict[str, T]]] = None,
         init_sync: bool = True,
         max_retries: Optional[int] = None,
         quorum_retries: int = 0,
+        rank0_synchronization_only: bool = False,
+        copy_pseudogradients_to_cpu: bool = False
     ) -> None:
         """
         Args:
@@ -305,6 +308,8 @@ class Manager:
         self._recovery_event: Optional[torch.Event] = None
 
         if self._group_rank == 0:
+            if hostname is None:
+                hostname = socket.gethostname()
             if port is None:
                 port = int(os.environ.get(MANAGER_PORT_ENV, 0))
 
@@ -360,6 +365,14 @@ class Manager:
                 + self._group_rank
             )
         )
+
+        self._rank0_synchronization_only = rank0_synchronization_only
+        if rank0_synchronization_only:
+            assert init_sync == False, "initial synchronization not supported with rank 0 synchronization only"
+            self._gloo_group_pg = dist.new_group(backend="gloo")
+            self._scatter_callbacks: List[Callable[[], None]] = []
+        
+        self._copy_pseudogradients_to_cpu = copy_pseudogradients_to_cpu
 
         self._update_fr_path()
 
@@ -432,6 +445,20 @@ class Manager:
         Returns:
             a Future that will be completed with the allreduced tensor
         """
+        if self._rank0_synchronization_only:
+            return self._allreduce_rank0(tensor, should_quantize, reduce_op)
+        elif self._pg.getBackendName() == "torchft-gloo" and self._copy_pseudogradients_to_cpu:
+            return self._allreduce_cpu(tensor, should_quantize, reduce_op)
+        else:
+            return self._allreduce_all_ranks(tensor, should_quantize, reduce_op)
+
+    @torch.profiler.record_function("torchft::manager::_allreduce_all_ranks")
+    def _allreduce_all_ranks(
+        self,
+        tensor: torch.Tensor,
+        should_quantize: bool = False,
+        reduce_op: ReduceOp = ReduceOp.AVG,
+    ) -> Work:
         if self.errored():
             return _DummyWork(tensor)
 
@@ -490,6 +517,163 @@ class Manager:
             )
             self.report_error(e)
 
+    @torch.profiler.record_function("torchft::manager::_allreduce_cpu")
+    def _allreduce_cpu(
+        self,
+        tensor: torch.Tensor,
+        should_quantize: bool = False,
+        reduce_op: ReduceOp = ReduceOp.AVG,
+    ) -> Work:
+        if self.errored():
+            return _DummyWork(tensor)
+
+        self.wait_quorum()
+        num_participants: int = self.num_participants()
+
+        if not self.is_participating():
+            tensor.zero_()
+
+        # special logic for average
+        pg_reduce_op = reduce_op
+        if reduce_op == ReduceOp.AVG:
+            if not torch.is_floating_point(tensor):
+                raise ValueError(
+                    "average reduce op is only supported for floating point tensors"
+                )
+            pg_reduce_op = ReduceOp.SUM
+
+        # TODO: increase timeout when waiting when healing
+        try:
+            tensor_cpu = tensor.cpu()
+            # Run the allreduce async and save the work object so we can wait on
+            # it later.
+            if should_quantize and IS_TRITON_AVAILABLE:
+                work = allreduce_quantized(
+                    [tensor_cpu],
+                    pg_reduce_op,
+                    self._pg,
+                    # pyre-fixme[6]: Expected `Optional[streams.Stream]` but got `_C.Stream`
+                    torch.accelerator.current_stream(),
+                )
+            else:
+                opts = AllreduceOptions()
+                opts.reduceOp = pg_reduce_op
+                work = self._pg.allreduce([tensor_cpu], opts)
+
+            # schedule grad normalization as a continuation
+            # on the Future
+            @torch.profiler.record_function("torchft::manager::allreduce::callback")
+            def callback(
+                fut: torch.futures.Future[torch.Tensor],
+            ) -> torch.Tensor:
+                nonlocal tensor
+                nonlocal tensor_cpu
+                tensor.copy_(tensor_cpu)
+                if reduce_op == ReduceOp.AVG:
+                    tensor /= num_participants
+                return tensor
+
+            managed_work = _ManagedWork(self, work, tensor)
+            fut = managed_work.get_future()
+            fut = cast(torch.futures.Future[torch.Tensor], fut)
+            fut = fut.then(callback)
+            return managed_work
+
+        except Exception as e:
+            self._logger.exception(
+                f"got exception in all reduce -- skipping remaining: {e}"
+            )
+            self.report_error(e)
+
+    @torch.profiler.record_function("torchft::manager::_allreduce_rank0")
+    def _allreduce_rank0(
+        self,
+        tensor: torch.Tensor,
+        should_quantize: bool = False,
+        reduce_op: ReduceOp = ReduceOp.AVG
+    ) -> Work:
+        if self.errored():
+            return _DummyWork(tensor)
+
+        self.wait_quorum()
+        num_participants: int = self.num_participants()
+
+        if not self.is_participating():
+            tensor.zero_()
+
+        # special logic for average
+        pg_reduce_op = reduce_op
+        if reduce_op == ReduceOp.AVG:
+            if not torch.is_floating_point(tensor):
+                raise ValueError(
+                    "average reduce op is only supported for floating point tensors"
+                )
+            pg_reduce_op = ReduceOp.SUM
+        
+        if self._group_rank == 0:
+            local_tensor = tensor.cpu()
+            local_tensors = [torch.empty_like(local_tensor) for _ in range(self._group_world_size)]
+            dist.gather(local_tensor, local_tensors, group=self._gloo_group_pg, dst=0)
+            global_tensor = torch.cat(local_tensors)
+            try:
+                if should_quantize and IS_TRITON_AVAILABLE:
+                    work = allreduce_quantized(
+                        [global_tensor],
+                        pg_reduce_op,
+                        self._pg,
+                        # pyre-fixme[6]: Expected `Optional[streams.Stream]` but got `_C.Stream`
+                        torch.accelerator.current_stream(),
+                    )
+                else:
+                    opts = AllreduceOptions()
+                    opts.reduceOp = pg_reduce_op
+                    work = self._pg.allreduce([global_tensor], opts)
+
+                @torch.profiler.record_function("torchft::manager::allreduce::callback")
+                def callback(
+                    fut: torch.futures.Future[torch.Tensor],
+                ) -> torch.Tensor:
+                    nonlocal tensor
+                    nonlocal global_tensor
+                    if reduce_op == ReduceOp.AVG:
+                        global_tensor /= num_participants
+                    return tensor
+
+                managed_work = _ManagedWork(self, work, tensor)
+                fut = managed_work.get_future()
+                fut = cast(torch.futures.Future[torch.Tensor], fut)
+                fut = fut.then(callback)
+
+                def scatter_callback() -> None:
+                    nonlocal tensor
+                    nonlocal global_tensor
+                    local_tensor = torch.empty_like(tensor, device="cpu")
+                    local_tensors = list(torch.chunk(global_tensor, self._group_world_size))
+                    dist.scatter(local_tensor, local_tensors, group=self._gloo_group_pg, src=0)
+                    tensor.copy_(local_tensor)
+                    return tensor
+
+                self._scatter_callbacks.append(scatter_callback)
+                return managed_work
+
+            except Exception as e:
+                self._logger.exception(
+                    f"got exception in all reduce -- skipping remaining: {e}"
+                )
+                self.report_error(e)
+                return _DummyWork(tensor)
+        else:
+            local_tensor = tensor.cpu()
+            dist.gather(local_tensor, None, group=self._gloo_group_pg, dst=0)
+
+            def scatter_callback() -> None:
+                nonlocal tensor
+                local_tensor = torch.empty_like(tensor, device="cpu")
+                dist.scatter(local_tensor, None, group=self._gloo_group_pg, src=0)
+                tensor.copy_(local_tensor)
+                return tensor
+
+            self._scatter_callbacks.append(scatter_callback)
             return _DummyWork(tensor)
 
     def report_error(self, e: Exception) -> None:
@@ -634,6 +818,19 @@ class Manager:
         quorum_timeout: timedelta,
         curr_device: int,
     ) -> None:
+        if self._rank0_synchronization_only:
+            return self._async_quorum_rank0(allow_heal, shrink_only, quorum_timeout, curr_device)
+        else:
+            return self._async_quorum_all_ranks(allow_heal, shrink_only, quorum_timeout, curr_device)
+
+    @torch.profiler.record_function("torchft::manager::_async_quorum_all_ranks")
+    def _async_quorum_all_ranks(
+        self,
+        allow_heal: bool,
+        shrink_only: bool,
+        quorum_timeout: timedelta,
+        curr_device: int,
+    ) -> None:
         torch.multiprocessing._set_thread_name("torchft_quorum")
 
         if curr_device >= 0 and torch.accelerator.is_available():
@@ -768,13 +965,16 @@ class Manager:
                         self._logger.info(
                             f"healing required, fetching checkpoint metadata from {recover_src_manager_address=} {max_step=}"
                         )
-                        primary_client = ManagerClient(
-                            recover_src_manager_address,
-                            connect_timeout=self._connect_timeout,
-                        )
-                        checkpoint_metadata = primary_client._checkpoint_metadata(
-                            self._group_rank, timeout=self._timeout
-                        )
+                        if isinstance(self._checkpoint_transport, PGTransport):
+                            checkpoint_metadata = None
+                        else:
+                            primary_client = ManagerClient(
+                                recover_src_manager_address,
+                                connect_timeout=self._connect_timeout,
+                            )
+                            checkpoint_metadata = primary_client._checkpoint_metadata(
+                                self._group_rank, timeout=self._timeout
+                            )
                         recover_src_replica_rank = quorum.recover_src_replica_rank
                         assert recover_src_replica_rank is not None, (
                             "must have a recover rank when healing"
@@ -804,6 +1004,261 @@ class Manager:
                         self._step = max_step
                 except Exception as e:
                     self._logger.exception(f"got exception in recovery: {e}")
+                    self.report_error(e)
+
+                self._recovery_event = (
+                    torch.accelerator.current_stream().record_event()
+                    if recovery_stream is not None
+                    else None
+                )
+
+    @torch.profiler.record_function("torchft::manager::_async_quorum_rank0")
+    def _async_quorum_rank0(
+        self,
+        allow_heal: bool,
+        shrink_only: bool,
+        quorum_timeout: timedelta,
+        curr_device: int,
+    ) -> None:
+        torch.multiprocessing._set_thread_name("torchft_quorum")
+
+        if curr_device >= 0 and torch.accelerator.is_available():
+            torch.accelerator.set_device_index(curr_device)
+
+        quorum = None
+        with torch.profiler.record_function("torchft::manager::_client::_quorum"):
+            quorum = self._client._quorum(
+                group_rank=self._group_rank,
+                step=self._step,
+                checkpoint_metadata=self._checkpoint_transport.metadata(),
+                shrink_only=shrink_only,
+                timeout=quorum_timeout,
+                init_sync=self._init_sync,
+                commit_failures=self._commit_failures,
+            )
+
+        quorum_id = quorum.quorum_id
+        replica_rank = quorum.replica_rank
+        replica_world_size = quorum.replica_world_size
+        recover_src_manager_address = quorum.recover_src_manager_address
+        store_address = quorum.store_address
+        max_step = quorum.max_step
+        max_replica_rank = quorum.max_replica_rank
+        max_replica_world_size = quorum.max_world_size
+        replica_ids = quorum.replica_ids
+
+        ranks_in_quorum = [
+            extract_trailing_digits(replica_id.split(":")[0]) * self._group_world_size
+            + self._group_rank
+            for replica_id in replica_ids
+        ]
+
+        # When using async quorum we need to take the recovered workers.
+        # When not using async quorum we need to take the max world size as all
+        # workers will be healthy.
+        self._participating_replica_rank, self._participating_replica_world_size = (
+            (max_replica_rank, max_replica_world_size)
+            if self._use_async_quorum or not allow_heal
+            else (replica_rank, replica_world_size)
+        )
+
+        # For fixed with spares we need to ensure that we don't have more
+        # participating replicas than the min replica size.
+        if self._replica_world_size_mode == WorldSizeMode.FIXED_WITH_SPARES:
+            self._participating_replica_world_size = min(
+                self._participating_replica_world_size, self._min_replica_size
+            )
+            if (
+                self._participating_replica_rank is not None
+                and self._participating_replica_rank >= self._min_replica_size
+            ):
+                self._participating_replica_rank = None
+
+        if quorum_id != self._quorum_id:
+            self.quorum_logger.info(
+                "",
+                extra={
+                    "job_id": os.environ.get("JOB_ID", "unknown"),
+                    "replica_id": self._replica_id,
+                    "rank": self._group_rank,
+                    "quorum_id": quorum_id,
+                    "step": max_step,
+                },
+            )
+            store_prefixed_addr = (
+                f"{store_address}/torchft/{quorum_id}/{self._group_rank}"
+            )
+
+            self._logger.info(f"reconfiguring for {quorum_id=} {store_prefixed_addr=}")
+            # We use the replica rank and world as we want all replicas in the PG.
+            try:
+                self._quorum_id = quorum_id
+                with torch.profiler.record_function("torchft::manager::_pg::configure"):
+                    # Reset GPU state for Flight Recorder
+                    if torch.accelerator.is_available():
+                        torch.accelerator.synchronize()
+                    if self._group_rank == 0:
+                        self._pg.configure(
+                            store_prefixed_addr,
+                            self._replica_id if self._replica_id is not None else "0",
+                            replica_rank,
+                            replica_world_size,
+                            quorum_id,
+                            self._group_rank,
+                            self._group_world_size,
+                            ranks_in_quorum,
+                        )
+                    # We need to reset the trace after reconfiguring the PG because that
+                    # calls abort which may trigger a dump
+                    self._logger.info(
+                        f"resetting fr recording for quorum id {self._quorum_id}"
+                    )
+                    self._update_fr_path()
+                    torch._C._distributed_c10d._reset_fr_recording_nccl()  # pyre-ignore
+            except Exception as e:
+                self._logger.exception(f"got exception in pg configure: {e}")
+                self.report_error(e)
+                return
+
+        if allow_heal:
+            # run recovery on the recovery stream if available
+            recovery_stream = self._recovery_stream
+            with get_stream_context(recovery_stream):
+
+                # gather all healthy and recovering replicas on this replica on rank 0
+                gathered_candidates = [None for _ in range(self._group_world_size)]
+                dist.all_gather_object(
+                    gathered_candidates,
+                    (quorum.recover_src_replica_rank, quorum.recover_dst_replica_ranks),
+                    group=self._gloo_group_pg
+                )
+
+                source_replicas = set()
+                destination_replicas = set()
+                for source, destinations in gathered_candidates:
+                    if source is not None:
+                        source_replicas.add(source)
+                    if destinations:
+                        destination_replicas.update(destinations)
+
+                if self._group_rank == 0:
+                    
+                    # gather all healthy and recovering replicas across all participating replicas
+                    gathered_candidates = [None for _ in range(self._participating_replica_world_size)]
+                    dist.all_gather_object(
+                        gathered_candidates,
+                        (source_replicas, destination_replicas),
+                        group=self._pg
+                    )
+
+                    source_replicas = set()
+                    destination_replicas = set()
+                    for sources, destinations in gathered_candidates:
+                        if sources:
+                            source_replicas.update(sources)
+                        if destinations:
+                            destination_replicas.update(destinations)
+
+                    source_replicas = sorted(source_replicas)
+                    destination_replicas = sorted(destination_replicas)
+
+                    i = 0
+                    num_sources = len(source_replicas)
+                    healing_assignments = []
+                    sources = {}
+                    for destination in destination_replicas:
+                        source = source_replicas[i % num_sources]
+                        healing_assignments.append(tuple((source, destination)))
+                        sources[destination] = source
+                        i += 1
+
+                    # broadcast result back to all ranks on this replica
+                    is_source = self._participating_replica_rank in source_replicas
+                    assigned_destinations = [destination for source, destination in healing_assignments
+                                             if source == self._participating_replica_rank]
+                    is_destination = self._participating_replica_rank in destination_replicas
+                    dist.broadcast_object_list(
+                        [is_source, is_destination],
+                        src=0,
+                        group=self._gloo_group_pg
+                    )
+                else:
+                    status = [None, None]
+                    dist.broadcast_object_list(status, src=0, group=self._gloo_group_pg)
+                    is_source, is_destination = status
+
+                try:
+                    if is_source:
+                        if self._group_rank == 0:
+                            self._logger.info(
+                                f"peers need recovery from us {assigned_destinations}"
+                            )
+                            with torch.profiler.record_function(
+                                "torchft::manager::_checkpoint_transport::send_checkpoint"
+                            ):
+                                self._checkpoint_transport.send_checkpoint(
+                                    dst_ranks=assigned_destinations,
+                                    step=max_step,
+                                    state_dict=self._manager_state_dict(),
+                                    timeout=self._timeout,
+                                )
+                        else:
+                            self._manager_state_dict()
+
+                    # See manager.rs for healing conditions
+                    if is_destination:
+                        self._healing = True
+                        if self._group_rank == 0:
+                            self._logger.info(
+                                f"healing required, fetching checkpoint metadata from {recover_src_manager_address=} {max_step=}"
+                            )
+                            if isinstance(self._checkpoint_transport, PGTransport):
+                                checkpoint_metadata = None
+                            else:
+                                primary_client = ManagerClient(
+                                    recover_src_manager_address,
+                                    connect_timeout=self._connect_timeout,
+                                )
+                                checkpoint_metadata = primary_client._checkpoint_metadata(
+                                    self._group_rank, timeout=self._timeout
+                                )
+                            self._logger.info(
+                                f"fetching checkpoint from {sources[self._participating_replica_rank]=} with {checkpoint_metadata=}"
+                            )
+                            # we apply the user state dict only when safe from the main thread
+                            # save it for now
+                            with torch.profiler.record_function(
+                                "torchft::manager::_checkpoint_transport::recv_checkpoint"
+                            ):
+                                self._pending_state_dict = self._checkpoint_transport.recv_checkpoint(
+                                    src_rank=sources[self._participating_replica_rank],
+                                    metadata=checkpoint_metadata,
+                                    step=max_step,
+                                    timeout=self._timeout,
+                                )
+
+                            dist.broadcast_object_list([self._pending_state_dict], src=0, group=self._gloo_group_pg)
+
+                            # pyre-fixme[6]: got object
+                            self.load_state_dict(self._pending_state_dict["torchft"])
+
+                            # This isn't strictly needed as loading the state_dict above should
+                            # restore the correct step but it makes writing tests simpler.
+                            self._step = max_step
+                        else:
+                            data = [None]
+                            dist.broadcast_object_list(data, src=0, group=self._gloo_group_pg)
+                            self._pending_state_dict = data[0]
+
+                            # pyre-fixme[6]: got object
+                            self.load_state_dict(self._pending_state_dict["torchft"])
+
+                            # This isn't strictly needed as loading the state_dict above should
+                            # restore the correct step but it makes writing tests simpler.
+                            self._step = max_step
+                except Exception as e:
+                    self._logger.exception(
+                        f"got exception in recovery: {e}")
                     self.report_error(e)
 
                 self._recovery_event = (
@@ -1052,6 +1507,10 @@ class Manager:
             return False
         return True
 
+    def scatter_grads(self) -> None:
+        for callback in self._scatter_callbacks:
+            callback()
+        self._scatter_callbacks.clear()
 
 class _ManagerLogger:
     def __init__(self, manager: Manager, replica_id: str, group_rank: int) -> None:
