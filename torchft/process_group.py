@@ -114,8 +114,12 @@ def create_store_client(store_addr: str, timeout: timedelta) -> Store:
 
     Ex: localhost:1234/my/prefix
     """
-    host, _, rest = store_addr.partition(":")
-    port, _, prefix = rest.partition("/")
+    # IPv6-safe: the address is host:port/prefix (optionally [host]:port/...).
+    # Split off the prefix, then take the port as the field after the LAST colon
+    # so a bare IPv6 address (e.g. a flat-IPv6 fabric) is not mangled.
+    addr_part, _, prefix = store_addr.partition("/")
+    host, _, port = addr_part.rpartition(":")
+    host = host.strip("[]")
 
     store = TCPStore(
         host_name=host,
@@ -176,6 +180,7 @@ class ProcessGroup(BaseProcessGroup):
         """
         raise NotImplementedError("not implemented")
 
+    # pyrefly: ignore [bad-override]
     def allreduce_coalesced(
         self,
         tensors: List[torch.Tensor],
@@ -355,6 +360,7 @@ class ProcessGroup(BaseProcessGroup):
         )
 
     @property
+    # pyrefly: ignore [bad-override]
     def group_name(self) -> str:
         if self._group_name is None:
             raise ValueError("ProcessGroup name not set")
@@ -655,6 +661,7 @@ class ProcessGroupGloo(ProcessGroupWrapper):
         if self._global_ranks:
             backend_class.options.global_ranks_in_group = self._global_ranks
         if self._group_rank and self._group_world_size:
+            # pyrefly: ignore [bad-assignment]
             backend_class.options.group_name = f"torchft_quorum_{self._quorum_id}_rank_{self._group_rank % self._group_world_size}"
 
         pg._register_backend(
@@ -663,6 +670,10 @@ class ProcessGroupGloo(ProcessGroupWrapper):
         if torch.cuda.is_available():
             pg._register_backend(
                 torch.device("cuda"), ProcessGroup.BackendType.GLOO, backend_class
+            )
+        if torch.xpu.is_available():
+            pg._register_backend(
+                torch.device("xpu"), ProcessGroup.BackendType.GLOO, backend_class
             )
         return pg
 
@@ -728,10 +739,10 @@ class _WorkAcceleratorTimeout(Work):
                 if not self._work.wait():
                     return False
 
-            # Always use cuda stream for timeout to avoid ProcessGroupNCCL
-            # watchdog firing and crashing the process.
+            # Synchronize the current accelerator stream so the timeout fires
+            # before the NCCL/XCCL watchdog can crash the process.
             if timeout is not None:
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
 
             return True
 
@@ -819,6 +830,7 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
         # crash the whole program.
         if hasattr(opts, "timeout"):
             # apply default timeout to disable
+            # pyrefly: ignore [missing-attribute]
             opts.timeout = AllgatherOptions().timeout
         return opts
 
@@ -857,6 +869,7 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
         if self._global_ranks:
             opts.global_ranks_in_group = self._global_ranks
         if self._group_rank and self._group_world_size:
+            # pyrefly: ignore [bad-assignment]
             opts.group_name = f"torchft_quorum_{self._quorum_id}_rank_{self._group_rank % self._group_world_size}"
 
         pg = BaseProcessGroup(store, rank, world_size)
@@ -935,6 +948,7 @@ class ProcessGroupXCCL(ProcessGroupWrapper):
         # crash the whole program.
         if hasattr(opts, "timeout"):
             # apply default timeout to disable
+            # pyrefly: ignore [missing-attribute]
             opts.timeout = AllgatherOptions().timeout
         return opts
 
@@ -990,12 +1004,11 @@ class ProcessGroupXCCL(ProcessGroupWrapper):
         # stream.
         self._errored = RuntimeError("aborted")
 
-        super().abort(errored)
+        super().abort(errored=errored)
 
     def errored(self) -> Optional[Exception]:
         # force a synchronization to ensure all work is complete
-        torch.xpu.current_stream().synchronize()
-
+        synchronize()
         return self._errored
 
     def getBackendName(self) -> str:
@@ -1526,6 +1539,7 @@ class ProcessGroupBaby(ProcessGroup):
             else -1
         )
 
+        # pyrefly: ignore [bad-assignment]
         self._p = p = ctx.Process(
             target=self._worker,
             args=(
@@ -1931,8 +1945,10 @@ class _PickleSafeOptions:
     @classmethod
     def safe_args(cls, args: T) -> T:
         if isinstance(args, tuple):
+            # pyrefly: ignore [bad-return]
             return tuple(cls.safe_args(arg) for arg in args)
         elif isinstance(args, list):
+            # pyrefly: ignore [bad-return]
             return [cls.safe_args(arg) for arg in args]
         elif isinstance(
             args,
@@ -1946,6 +1962,7 @@ class _PickleSafeOptions:
                 ReduceScatterOptions,
             ),
         ):
+            # pyrefly: ignore [bad-return]
             return cls.from_torch(args)
         else:
             return args
@@ -1953,10 +1970,13 @@ class _PickleSafeOptions:
     @classmethod
     def unsafe_args(cls, args: T) -> T:
         if isinstance(args, tuple):
+            # pyrefly: ignore [bad-return]
             return tuple(cls.unsafe_args(arg) for arg in args)
         elif isinstance(args, list):
+            # pyrefly: ignore [bad-return]
             return [cls.unsafe_args(arg) for arg in args]
         elif isinstance(args, cls):
+            # pyrefly: ignore [bad-return]
             return args.to_torch()
         else:
             return args
@@ -2104,10 +2124,13 @@ class ProcessGroupBabyXCCL(ProcessGroupBaby):
         # Check if XPU and XCCL are available
         from torch.distributed import ProcessGroupXCCL as BaseProcessGroupXCCL
 
+        # pyre-fixme[16]: no attribute ProcessGroupXCCL
+        opts = BaseProcessGroupXCCL.Options()
+
         pg = BaseProcessGroup(store, rank, world_size)
         pg._set_default_backend(ProcessGroup.BackendType.XCCL)
-        # pyre-fixme[16]: no attribute ProcessGroupNCCL
-        backend_class = BaseProcessGroupXCCL(store, rank, world_size)
+        # pyre-fixme[16]: no attribute ProcessGroupXCCL
+        backend_class = BaseProcessGroupXCCL(store, rank, world_size, opts)
         backend_class._set_sequence_number_for_group()
         pg._register_backend(
             torch.device("xpu"), ProcessGroup.BackendType.XCCL, backend_class
