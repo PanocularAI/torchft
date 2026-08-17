@@ -102,16 +102,23 @@ def push_pull(
     )
 
 
-def push_pull_flat(addr, flat, *, quantize, numels):
+def push_pull_flat(
+    addr, flat, *, quantize, numels, fragment=None, num_fragments=None
+):
     """One raw-protocol full-sync push of an ARBITRARY flat pseudo-gradient
     (push_pull only supports a constant fill value). Drains and discards the
-    response body; returns the response header dict."""
+    response body; returns the response header dict. ``fragment`` /
+    ``num_fragments`` build a fragment push's header (see the server's wire
+    format docstring); ``numels`` must then be the fragment's own numels."""
     header = {
         "flag": 1,
         "speed": 1.0,
         "baseline_revision": 0,
         "numel": flat.numel(),
     }
+    if fragment is not None:
+        header["fragment"] = fragment
+        header["num_fragments"] = num_fragments
     if quantize:
         q, scales = _quantize_int8(flat, numels)
         header["dtype"] = "int8"
@@ -1464,5 +1471,394 @@ class TestReplicaMode(TestCase):
         server = self._server()
         try:
             self._spawn(_replica_blend_child, server.address())
+        finally:
+            server.shutdown()
+
+    def test_replica_fragment_rotation(self) -> None:
+        server = self._server(num_fragments=2)
+        try:
+            self._spawn(_replica_fragment_child, server.address())
+            self.assertEqual(server.status()["applied_pushes"], 4)
+        finally:
+            server.shutdown()
+
+
+def _replica_fragment_child(
+    rank: int, dist_port: int, server_addr: str
+) -> None:
+    """Child for test_replica_fragment_rotation: fragment boundaries must
+    stay lockstep across ranks — the pseudo-gradient gathers and adopt
+    broadcasts are collectives on the MAIN thread; only the lead's HTTP
+    roundtrip overlaps in the background."""
+    _init_replica_dist(rank, dist_port)
+    try:
+        model = _replica_base_model()
+        _shard_params_(model)
+        opt = optim.SGD(model.parameters(), lr=0.1)
+        client = AsyncDiLoCo(
+            server_addr, model, opt, sync_every=4, num_fragments=2,
+            replica_pg=pt_dist.group.WORLD,
+        )
+        with client:
+            # sync_every=4, P=2 → a fragment boundary every 2 steps; 8 steps
+            # = 4 boundaries: launch f0 / adopt f0 + launch f1 / adopt f1 +
+            # launch f0 / adopt f0 + launch f1 (drained at exit, not adopted).
+            _drive_windows(model, opt, windows=4, sync_every=2)
+        assert client._frag_idx == 0, client._frag_idx  # 4 rotations wrap
+        # The lead adopted pushes 1..3 (revisions 1..3); push 4 was drained.
+        assert client._baseline_revision == (3 if rank == 0 else 0), (
+            rank,
+            client._baseline_revision,
+        )
+    finally:
+        pt_dist.destroy_process_group()
+
+
+class TestFragmentSync(TestCase):
+    """Fragment-wise sync (Decoupled DiLoCo, arXiv 2604.21428): the
+    partition, wire validation, bitwise equivalence of fragment pushes to
+    whole-model pushes, and the client's staggered overlap pipeline."""
+
+    def test_fragment_bounds_partition(self) -> None:
+        from torchft.async_diloco import _fragment_bounds
+
+        self.assertEqual(_fragment_bounds([10, 10, 10, 10], 1), [(0, 4)])
+        self.assertEqual(_fragment_bounds([10, 10, 10, 10], 2), [(0, 2), (2, 4)])
+        self.assertEqual(
+            _fragment_bounds([10, 10, 10, 10], 4),
+            [(0, 1), (1, 2), (2, 3), (3, 4)],
+        )
+        # A huge tail param: every remaining fragment still gets >= 1 param.
+        self.assertEqual(_fragment_bounds([1, 1, 1, 100], 2), [(0, 3), (3, 4)])
+        # Coverage, contiguity and non-emptiness for arbitrary shapes.
+        numels = [3, 7, 1, 9, 2, 8, 5]
+        for p in range(1, len(numels) + 1):
+            bounds = _fragment_bounds(numels, p)
+            self.assertEqual(len(bounds), p)
+            self.assertEqual(bounds[0][0], 0)
+            self.assertEqual(bounds[-1][1], len(numels))
+            for (a0, b0), (a1, _) in zip(bounds, bounds[1:]):
+                self.assertEqual(b0, a1)
+            for a0, b0 in bounds:
+                self.assertGreater(b0, a0)
+        with self.assertRaises(ValueError):
+            _fragment_bounds([1, 2], 3)
+        with self.assertRaises(ValueError):
+            _fragment_bounds([1, 2], 0)
+
+    def test_ctor_validation(self) -> None:
+        model = _make_model()
+        opt = optim.SGD(model.parameters(), lr=0.5)
+        with self.assertRaises(ValueError):
+            AsyncDiLoCoServer(
+                model, opt, port=0, num_fragments=2, grace_period=0.5
+            )
+        with self.assertRaises(ValueError):
+            AsyncDiLoCo(
+                "http://localhost:1/sync", model, opt,
+                sync_every=5, num_fragments=2,  # not divisible
+            )
+        with self.assertRaises(ValueError):
+            AsyncDiLoCo(
+                "http://localhost:1/sync", model, opt,
+                sync_every=4, num_fragments=0,
+            )
+
+    def test_fragmented_pushes_bitwise_equal_whole_push(self) -> None:
+        """The server-level convergence-neutrality proof: P fragment pushes
+        of the same deltas commit BITWISE the same θ and momentum as one
+        whole-model push — block correction, look-ahead and momentum are all
+        per-parameter, and int8 quantization blocks are per-parameter too."""
+        from torchft.async_diloco import _fragment_bounds
+        from torchft.heloco import HeLoCoOptimizer, HeLoCoServer
+
+        def heloco_opt(m: nn.Module) -> optim.Optimizer:
+            return HeLoCoOptimizer(m.parameters(), lr=0.7, momentum=0.9)
+
+        def sgd_opt(m: nn.Module) -> optim.Optimizer:
+            return optim.SGD(m.parameters(), lr=0.5, momentum=0.9)
+
+        cases = [
+            ("heloco-fp32", HeLoCoServer, heloco_opt, False),
+            ("heloco-int8", HeLoCoServer, heloco_opt, True),
+            ("base-sgd-fp32", AsyncDiLoCoServer, sgd_opt, False),
+        ]
+        P = 3
+        for label, cls, opt_f, quantize in cases:
+            with self.subTest(label):
+                torch.manual_seed(11)
+                model_a = _make_model()
+                torch.manual_seed(11)
+                model_b = _make_model()
+                opt_a, opt_b = opt_f(model_a), opt_f(model_b)
+                server_a = cls(model_a, opt_a, port=0, should_quantize=quantize)
+                server_b = cls(
+                    model_b, opt_b, port=0, should_quantize=quantize,
+                    num_fragments=P,
+                )
+                try:
+                    numels = [p.numel() for p in model_a.parameters()]
+                    bounds = _fragment_bounds(numels, P)
+                    # Two rounds: round 2 corrects against seeded momentum.
+                    for rnd in range(2):
+                        flat = torch.randn(
+                            sum(numels),
+                            generator=torch.Generator().manual_seed(100 + rnd),
+                        )
+                        push_pull_flat(
+                            server_a.address(), flat,
+                            quantize=quantize, numels=numels,
+                        )
+                        off = 0
+                        for f, (i, j) in enumerate(bounds):
+                            n = sum(numels[i:j])
+                            push_pull_flat(
+                                server_b.address(), flat[off : off + n],
+                                quantize=quantize, numels=numels[i:j],
+                                fragment=f, num_fragments=P,
+                            )
+                            off += n
+                    for (name, p_a), p_b in zip(
+                        model_a.named_parameters(), model_b.parameters()
+                    ):
+                        self.assertTrue(torch.equal(p_a, p_b), name)
+                    for p_a, p_b in zip(
+                        model_a.parameters(), model_b.parameters()
+                    ):
+                        s_a = opt_a.state.get(p_a, {})
+                        s_b = opt_b.state.get(p_b, {})
+                        for key in ("m", "momentum_buffer"):
+                            if key in s_a or key in s_b:
+                                self.assertTrue(
+                                    torch.equal(s_a[key], s_b[key]), key
+                                )
+                    self.assertEqual(server_a.status()["revision"], 2)
+                    self.assertEqual(server_b.status()["revision"], 2 * P)
+                    # Pull-only responses (whole model on both) bitwise equal
+                    # — covers the fragmented server's snapshot concatenation
+                    # and HeLoCo's fragment-scoped look-ahead.
+                    pa, _, _, _ = push_pull(
+                        server_a.address(), model_a, full_sync=False
+                    )
+                    pb, _, _, _ = push_pull(
+                        server_b.address(), model_b, full_sync=False
+                    )
+                    for name in pa:
+                        self.assertTrue(torch.equal(pa[name], pb[name]), name)
+                finally:
+                    server_a.shutdown()
+                    server_b.shutdown()
+
+    def test_materialized_fragment_apply_matches_whole(self) -> None:
+        """_handle_sync with a materialized fragment flat buffer (the
+        non-streaming entry, exercising _unflatten's fragment slicing)."""
+        from torchft.async_diloco import _fragment_bounds
+        from torchft.heloco import HeLoCoOptimizer, HeLoCoServer
+
+        torch.manual_seed(17)
+        model_a = _make_model()
+        torch.manual_seed(17)
+        model_b = _make_model()
+        opt_a = HeLoCoOptimizer(model_a.parameters(), lr=0.7, momentum=0.9)
+        opt_b = HeLoCoOptimizer(model_b.parameters(), lr=0.7, momentum=0.9)
+        server_a = HeLoCoServer(model_a, opt_a, port=0)
+        server_b = HeLoCoServer(model_b, opt_b, port=0, num_fragments=2)
+        try:
+            numels = [p.numel() for p in model_a.parameters()]
+            flat = torch.randn(
+                sum(numels), generator=torch.Generator().manual_seed(23)
+            )
+            server_a._handle_sync(
+                is_full_sync=True, worker_speed=1.0, baseline_revision=0,
+                flat_grads=flat,
+            )
+            off = 0
+            for f, (i, j) in enumerate(_fragment_bounds(numels, 2)):
+                n = sum(numels[i:j])
+                server_b._handle_sync(
+                    is_full_sync=True, worker_speed=1.0, baseline_revision=0,
+                    flat_grads=flat[off : off + n], fragment=f,
+                )
+                off += n
+            for (name, p_a), p_b in zip(
+                model_a.named_parameters(), model_b.parameters()
+            ):
+                self.assertTrue(torch.equal(p_a, p_b), name)
+        finally:
+            server_a.shutdown()
+            server_b.shutdown()
+
+    def test_wire_validation(self) -> None:
+        def mk_server(num_fragments: int) -> AsyncDiLoCoServer:
+            model = _make_model()
+            return AsyncDiLoCoServer(
+                model, optim.SGD(model.parameters(), lr=0.5), port=0,
+                num_fragments=num_fragments,
+            )
+
+        from torchft.async_diloco import _fragment_bounds
+
+        model = _make_model()
+        numels = [p.numel() for p in model.parameters()]
+        i, j = _fragment_bounds(numels, 2)[0]
+        frag0_numels = numels[i:j]
+        n0 = sum(frag0_numels)
+
+        server2 = mk_server(num_fragments=2)
+        try:
+            # Whole-model push to a fragmented server.
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                push_pull(server2.address(), model)
+            self.assertEqual(ctx.exception.code, 500)
+            # num_fragments mismatch.
+            with self.assertRaises(urllib.error.HTTPError):
+                push_pull_flat(
+                    server2.address(), torch.zeros(n0), quantize=False,
+                    numels=frag0_numels, fragment=0, num_fragments=3,
+                )
+            # Fragment index out of range.
+            with self.assertRaises(urllib.error.HTTPError):
+                push_pull_flat(
+                    server2.address(), torch.zeros(n0), quantize=False,
+                    numels=frag0_numels, fragment=5, num_fragments=2,
+                )
+            # Wrong fragment numel.
+            with self.assertRaises(urllib.error.HTTPError):
+                push_pull_flat(
+                    server2.address(), torch.zeros(n0 + 1), quantize=False,
+                    numels=frag0_numels, fragment=0, num_fragments=2,
+                )
+            # A valid fragment push still works after the failures.
+            resp = push_pull_flat(
+                server2.address(), torch.zeros(n0), quantize=False,
+                numels=frag0_numels, fragment=0, num_fragments=2,
+            )
+            self.assertTrue(resp["applied"])
+            self.assertEqual(resp["numel"], n0)  # fragment-sized response
+        finally:
+            server2.shutdown()
+
+        server1 = mk_server(num_fragments=1)
+        try:
+            # Fragment push to a whole-model server.
+            with self.assertRaises(urllib.error.HTTPError):
+                push_pull_flat(
+                    server1.address(), torch.zeros(n0), quantize=False,
+                    numels=frag0_numels, fragment=0, num_fragments=2,
+                )
+        finally:
+            server1.shutdown()
+
+    def test_client_schedule_and_overlap(self) -> None:
+        """sync_every=4, P=2 → a boundary every 2 steps rotating f0,f1,f0,f1;
+        each exchange launches at its boundary and is adopted at the next
+        (the slow roundtrip forces the join to actually block — backpressure
+        — without losing a single push)."""
+        torch.manual_seed(3)
+        s_model = nn.Linear(4, 5)  # 2 params → f0=weight, f1=bias
+        server = AsyncDiLoCoServer(
+            s_model, optim.SGD(s_model.parameters(), lr=0.5), port=0,
+            num_fragments=2,
+        )
+        try:
+            torch.manual_seed(3)
+            model = nn.Linear(4, 5)
+            opt = optim.SGD(model.parameters(), lr=0.1)
+            client = AsyncDiLoCo(
+                server.address(), model, opt, sync_every=4, num_fragments=2
+            )
+            order: list = []
+            real = client._session_roundtrip
+
+            def slow_roundtrip(flag, speed, flat_grads, fragment=None):
+                if flat_grads is not None:
+                    order.append(fragment)
+                    time.sleep(0.05)
+                return real(flag, speed, flat_grads, fragment=fragment)
+
+            client._session_roundtrip = slow_roundtrip
+            with client:
+                _drive_windows(model, opt, windows=4, sync_every=2)  # 8 steps
+            self.assertEqual(order, [0, 1, 0, 1])
+            self.assertEqual(server.status()["applied_pushes"], 4)
+            # Adopted pushes 1..3 (revisions 1..3); push 4 drained at exit.
+            self.assertEqual(client._baseline_revision, 3)
+            self.assertFalse(client._pending_resync)
+            # f0 (weight) was last committed by push 3 and adopted at the
+            # final boundary; push 4 only touched f1 — so the client's
+            # weight must equal the server's CURRENT weight exactly.
+            server_params, _, _, _ = push_pull(
+                server.address(), model, full_sync=False
+            )
+            self.assertTrue(
+                torch.equal(model.weight.data, server_params["weight"])
+            )
+        finally:
+            server.shutdown()
+
+    def test_join_failure_triggers_whole_model_resync(self) -> None:
+        torch.manual_seed(5)
+        s_model = nn.Linear(4, 5)
+        server = AsyncDiLoCoServer(
+            s_model, optim.SGD(s_model.parameters(), lr=0.5), port=0,
+            num_fragments=2,
+        )
+        try:
+            torch.manual_seed(9)  # different init: resync must adopt server's
+            model = nn.Linear(4, 5)
+            opt = optim.SGD(model.parameters(), lr=0.1)
+            client = AsyncDiLoCo(
+                server.address(), model, opt, sync_every=4, num_fragments=2
+            )
+            real = client._session_roundtrip
+
+            def flaky(flag, speed, flat_grads, fragment=None):
+                if flat_grads is not None:  # every push fails; pulls succeed
+                    raise RuntimeError("boom")
+                return real(flag, speed, flat_grads, fragment=fragment)
+
+            client._session_roundtrip = flaky
+            with client:
+                _drive_windows(model, opt, windows=1, sync_every=2)  # launch f0
+                _drive_windows(model, opt, windows=1, sync_every=2)  # join→fail
+                self.assertTrue(client._pending_resync)
+                self.assertIsNone(client._inflight)
+                _drive_windows(model, opt, windows=1, sync_every=2)  # resync
+            self.assertFalse(client._pending_resync)
+            self.assertEqual(server.status()["applied_pushes"], 0)
+            server_params = dict(s_model.named_parameters())
+            for name, p in model.named_parameters():
+                self.assertTrue(
+                    torch.equal(p.data, server_params[name].data), name
+                )
+        finally:
+            server.shutdown()
+
+    def test_rejected_push_resyncs_whole_model(self) -> None:
+        """A stale-baseline rejection means EVERY fragment's baseline is
+        suspect (server checkpoint restore) — the client must skip the
+        fragment-sized response and re-baseline the whole model."""
+        torch.manual_seed(7)
+        s_model = nn.Linear(4, 5)
+        server = AsyncDiLoCoServer(
+            s_model, optim.SGD(s_model.parameters(), lr=0.5), port=0,
+            num_fragments=2,
+        )
+        try:
+            torch.manual_seed(7)
+            model = nn.Linear(4, 5)
+            opt = optim.SGD(model.parameters(), lr=0.1)
+            client = AsyncDiLoCo(
+                server.address(), model, opt, sync_every=4, num_fragments=2
+            )
+            with client:
+                client._baseline_revision = 5  # ahead of server revision 0
+                _drive_windows(model, opt, windows=1, sync_every=2)  # launch
+                _drive_windows(model, opt, windows=1, sync_every=2)  # join→rej
+                self.assertTrue(client._pending_resync)
+                _drive_windows(model, opt, windows=1, sync_every=2)  # resync
+            self.assertFalse(client._pending_resync)
+            self.assertEqual(client._baseline_revision, 0)
+            self.assertEqual(server.status()["applied_pushes"], 0)
         finally:
             server.shutdown()

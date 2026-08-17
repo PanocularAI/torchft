@@ -185,6 +185,51 @@ def _dequantize_int8(
     return flat
 
 
+def _fragment_bounds(
+    numels: List[int], num_fragments: int
+) -> List[Tuple[int, int]]:
+    """Partition parameters into ``num_fragments`` contiguous, numel-balanced
+    fragments (Decoupled DiLoCo, arXiv 2604.21428 — the paper bin-packs
+    tensors; we keep fragments CONTIGUOUS in ``named_parameters()`` order so
+    every fragment is a contiguous slice of the existing flat wire layout,
+    and transformer parameters are homogeneous enough that balance is
+    near-identical).
+
+    Returns half-open ``(start_param_idx, end_param_idx)`` ranges covering all
+    parameters. Deterministic from ``(numels, num_fragments)`` alone, so the
+    client and server derive identical tables independently — the wire only
+    carries the fragment INDEX, never the layout.
+    """
+    n_params = len(numels)
+    if num_fragments < 1:
+        raise ValueError(f"num_fragments must be >= 1, got {num_fragments}")
+    if num_fragments > n_params:
+        raise ValueError(
+            f"num_fragments ({num_fragments}) exceeds the parameter tensor "
+            f"count ({n_params})"
+        )
+    total = sum(numels)
+    bounds: List[Tuple[int, int]] = []
+    start = 0
+    acc = 0
+    for i, n in enumerate(numels):
+        acc += n
+        remaining_frags = num_fragments - len(bounds) - 1  # after this one
+        if remaining_frags == 0:
+            continue  # the last fragment takes everything that remains
+        remaining_params = n_params - (i + 1)
+        # Cut once the running numel crosses this fragment's ideal boundary,
+        # or when every remaining fragment needs one of the remaining params.
+        if (
+            acc * num_fragments >= (len(bounds) + 1) * total
+            or remaining_params == remaining_frags
+        ):
+            bounds.append((start, i + 1))
+            start = i + 1
+    bounds.append((start, n_params))
+    return bounds
+
+
 class DelayedNesterovOptimizer(optim.Optimizer):
     """
     Outer optimizer implementing Delayed Nesterov Momentum (DN) for async DiLoCo.
@@ -340,10 +385,19 @@ class AsyncDiLoCoServer:
           - ``dtype == "int8"`` (``should_quantize``): one fp32 scale per
             parameter tensor (``num_params × 4`` bytes, blockwise symmetric
             quantization) then ``numel`` int8 bytes.
+        Fragment-wise sync (``num_fragments`` > 1) adds ``"fragment": int``
+        and ``"num_fragments": int`` to a push's header; the payload then
+        covers only that fragment's parameters (its contiguous
+        ``named_parameters()`` slice — see :func:`_fragment_bounds`), with
+        one int8 scale per parameter IN the fragment. Both ends must agree
+        on ``num_fragments`` (validated per push). Pull-only requests are
+        always whole-model.
       - Response body (200): one JSON line
         ``{"new_steps": int, "revision": int, "applied": bool, "numel": int}``
-        followed by ``numel × 4`` raw float32 bytes of the global params
-        (the download is never quantized — see ``should_quantize``).
+        followed by ``numel × 4`` raw float32 bytes of the global params —
+        the pushed fragment's slice for a fragment push, the whole model
+        otherwise (the download is never quantized — see
+        ``should_quantize``).
         Failures are plain HTTP errors (500 processing / 503 at capacity),
         so a broken sync fails fast instead of wedging the worker.
 
@@ -369,6 +423,7 @@ class AsyncDiLoCoServer:
         grace_period: float = 0.0,
         checkpoint_path: Optional[str] = None,
         checkpoint_every: int = 10,
+        num_fragments: int = 1,
     ) -> None:
         """
         Args:
@@ -429,7 +484,24 @@ class AsyncDiLoCoServer:
                 None (default) disables checkpointing.
             checkpoint_every: Outer steps between checkpoints when
                 ``checkpoint_path`` is set. Defaults to 10.
+            num_fragments: Fragment-wise sync (Decoupled DiLoCo,
+                arXiv 2604.21428). The model is partitioned into this many
+                contiguous, numel-balanced fragments (:func:`_fragment_bounds`)
+                and workers push/pull ONE fragment per (shortened) window on a
+                staggered rotation — every transfer and per-push transient is
+                model/num_fragments sized. Each fragment's outer step is exact:
+                momentum, HeLoCo block correction and look-ahead are all
+                per-parameter, so P fragment pushes commit bitwise the same
+                state as one whole-model push of the same deltas. Must match
+                the workers' ``num_fragments``. 1 (default) is the legacy
+                whole-model protocol. Incompatible with ``grace_period`` > 0
+                (grace batches whole-model gradient dicts).
         """
+        if num_fragments > 1 and grace_period > 0.0:
+            raise ValueError(
+                "fragment-wise sync (num_fragments > 1) is incompatible with "
+                "grace_period batching"
+            )
         self._lock = threading.Lock()
         self._model = model
         self._outer_optimizer = outer_optimizer
@@ -441,6 +513,16 @@ class AsyncDiLoCoServer:
             self._param_shapes.append(p.shape)
             self._param_numels.append(p.numel())
         self._total_numel: int = sum(self._param_numels)
+        self._params_by_name: Dict[str, nn.Parameter] = dict(
+            model.named_parameters()
+        )
+        self._num_fragments: int = num_fragments
+        self._frag_bounds: List[Tuple[int, int]] = _fragment_bounds(
+            self._param_numels, num_fragments
+        )
+        self._frag_numels: List[int] = [
+            sum(self._param_numels[a:b]) for a, b in self._frag_bounds
+        ]
 
         self._quantize: bool = should_quantize
         self._grace_period: float = grace_period
@@ -460,9 +542,11 @@ class AsyncDiLoCoServer:
         self._revision: int = 0
         self._applied_pushes: int = 0
         self._last_step_time: Optional[float] = None  # wall clock, for /status
-        # One snapshot shared by all sessions at the same revision
-        # (K concurrent syncs no longer cost K model-size clones).
-        self._snapshot_cache: Optional[Tuple[int, torch.Tensor]] = None
+        # One snapshot per FRAGMENT shared by all sessions until that
+        # fragment's next commit (K concurrent syncs no longer cost K
+        # model-size clones; the caches sum to at most one model copy).
+        # P=1: key 0 is the whole model — the legacy behavior exactly.
+        self._snapshot_cache: Dict[int, Tuple[int, torch.Tensor]] = {}
 
         self._checkpoint_path: Optional[str] = checkpoint_path
         self._checkpoint_every: int = checkpoint_every
@@ -517,13 +601,42 @@ class AsyncDiLoCoServer:
                     use_streaming = (
                         is_full_sync and server_ref._grace_period == 0.0
                     )
+                    fragment: Optional[int] = None
                     if is_full_sync:
                         wire_dtype = header.get("dtype", "float32")
                         numel = int(header["numel"])
-                        if numel != server_ref._total_numel:
+                        # A fragmented server accepts only fragment pushes at
+                        # its own P; a P=1 server only the legacy whole-model
+                        # header. One spec field drives both ends, so any
+                        # mismatch is a config bug — fail loudly.
+                        if "fragment" in header:
+                            client_p = int(header.get("num_fragments", 0))
+                            if client_p != server_ref._num_fragments:
+                                raise ValueError(
+                                    f"num_fragments mismatch: client "
+                                    f"{client_p}, server "
+                                    f"{server_ref._num_fragments}"
+                                )
+                            fragment = int(header["fragment"])
+                            if not 0 <= fragment < server_ref._num_fragments:
+                                raise ValueError(
+                                    f"fragment index {fragment} out of range "
+                                    f"(num_fragments="
+                                    f"{server_ref._num_fragments})"
+                                )
+                            expected_numel = server_ref._frag_numels[fragment]
+                        else:
+                            if server_ref._num_fragments != 1:
+                                raise ValueError(
+                                    "whole-model push to a fragmented server "
+                                    f"(num_fragments="
+                                    f"{server_ref._num_fragments})"
+                                )
+                            expected_numel = server_ref._total_numel
+                        if numel != expected_numel:
                             raise ValueError(
                                 f"pseudo-gradient numel mismatch: got {numel}, "
-                                f"expected {server_ref._total_numel}"
+                                f"expected {expected_numel}"
                             )
                         if use_streaming:
                             pass  # body is read under the stream lock below
@@ -558,7 +671,7 @@ class AsyncDiLoCoServer:
                         # copy, so a slow reader can't stall the next apply.
                         with server_ref._stream_lock:
                             stream_bufs = server_ref._stream_body_into_bufs(
-                                self.rfile, wire_dtype
+                                self.rfile, wire_dtype, fragment
                             )
                             resp, snapshot_flat = server_ref._handle_sync(
                                 is_full_sync=is_full_sync,
@@ -568,6 +681,7 @@ class AsyncDiLoCoServer:
                                 ),
                                 flat_grads=None,
                                 pseudo_grads=stream_bufs,
+                                fragment=fragment,
                             )
                     else:
                         resp, snapshot_flat = server_ref._handle_sync(
@@ -577,6 +691,7 @@ class AsyncDiLoCoServer:
                                 header.get("baseline_revision", 0)
                             ),
                             flat_grads=flat_grads,
+                            fragment=fragment,
                         )
 
                     resp["numel"] = snapshot_flat.numel()
@@ -705,6 +820,7 @@ class AsyncDiLoCoServer:
                 "applied_pushes": self._applied_pushes,
                 "last_outer_step_time": self._last_step_time,
                 "dylu_pool_size": len(self._worker_speeds),
+                "num_fragments": self._num_fragments,
             }
 
     def shutdown(self) -> None:
@@ -812,8 +928,16 @@ class AsyncDiLoCoServer:
     # Flat-buffer helpers (R1: one coalesced transfer per direction)      #
     # ------------------------------------------------------------------ #
 
+    def _frag_names(self, fragment: Optional[int]) -> List[str]:
+        """The parameter names a push covers: one fragment's contiguous slice,
+        or every parameter for whole-model (``fragment=None``; P=1 legacy)."""
+        if fragment is None:
+            return self._param_names
+        a, b = self._frag_bounds[fragment]
+        return self._param_names[a:b]
+
     def _stream_body_into_bufs(
-        self, rfile: BinaryIO, wire_dtype: str
+        self, rfile: BinaryIO, wire_dtype: str, fragment: Optional[int] = None
     ) -> Dict[str, torch.Tensor]:
         """Read one push's body parameter-by-parameter into the persistent
         streaming buffers, returning them shaped like :meth:`_unflatten`'s dict.
@@ -826,24 +950,27 @@ class AsyncDiLoCoServer:
         they land in changes, from a fresh whole-model allocation per push to
         one reused set. Peak transient drops from O(model) per concurrent push
         to O(largest parameter) on the int8 path and O(socket chunk) on fp32.
+
+        A fragment push fills (and returns) only that fragment's buffers; the
+        rest of the lazily-allocated set is untouched.
         """
         if self._stream_bufs is None:
             self._stream_bufs = {
                 name: torch.empty(shape, dtype=torch.float32)
                 for name, shape in zip(self._param_names, self._param_shapes)
             }
-        bufs = self._stream_bufs
+        names = self._frag_names(fragment)
+        numels = [self._params_by_name[n].numel() for n in names]
+        bufs = {name: self._stream_bufs[name] for name in names}
         if wire_dtype == "int8":
             scales = _bytes_to_tensor(
-                _read_exact(rfile, len(self._param_numels) * 4), torch.float32
+                _read_exact(rfile, len(numels) * 4), torch.float32
             )
-            for i, (name, n) in enumerate(
-                zip(self._param_names, self._param_numels)
-            ):
+            for i, (name, n) in enumerate(zip(names, numels)):
                 q = _bytes_to_tensor(_read_exact(rfile, n), torch.int8)
                 torch.mul(q.float(), scales[i], out=bufs[name].view(-1))
         elif wire_dtype == "float32":
-            for name in self._param_names:
+            for name in names:
                 flat = bufs[name].view(-1)
                 _read_exact_into(
                     rfile, memoryview(flat.numpy()).cast("B")
@@ -852,67 +979,108 @@ class AsyncDiLoCoServer:
             raise ValueError(f"unsupported wire dtype {wire_dtype!r}")
         return bufs
 
-    def _unflatten(self, flat: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Split one flat buffer into per-parameter views (no copies)."""
+    def _unflatten(
+        self, flat: torch.Tensor, fragment: Optional[int] = None
+    ) -> Dict[str, torch.Tensor]:
+        """Split one flat buffer into per-parameter views (no copies). With
+        ``fragment`` set, the buffer covers only that fragment's slice."""
+        a, b = (
+            (0, len(self._param_names))
+            if fragment is None
+            else self._frag_bounds[fragment]
+        )
         out: Dict[str, torch.Tensor] = {}
         offset = 0
         for name, shape, numel in zip(
-            self._param_names, self._param_shapes, self._param_numels
+            self._param_names[a:b],
+            self._param_shapes[a:b],
+            self._param_numels[a:b],
         ):
             out[name] = flat[offset : offset + numel].view(shape)
             offset += numel
         return out
 
-    def _snapshot_flat(self) -> Tuple[torch.Tensor, int]:
-        """
-        Return ``(flat_params, revision)`` for the current global model.
+    def _frag_snapshot_locked(self, fragment: int) -> torch.Tensor:
+        """One fragment's flat snapshot, built at most once per commit TO THAT
+        FRAGMENT (a commit only moves its own fragment's params and momentum,
+        so other fragments' cached snapshots stay valid — the caches sum to at
+        most one model copy). Must hold ``self._lock``."""
+        cached = self._snapshot_cache.get(fragment)
+        if cached is not None:
+            return cached[1]
+        names = self._frag_names(fragment)
+        snap = self._build_snapshot_locked(names)
+        flat = torch.cat(
+            [snap[name].detach().reshape(-1).float() for name in names]
+        )
+        self._snapshot_cache[fragment] = (self._revision, flat)
+        return flat
 
-        The snapshot is built at most once per revision and shared by all
-        concurrent sessions — the cache is invalidated whenever an outer
-        step commits.
+    def _snapshot_flat(
+        self, fragment: Optional[int] = None
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Return ``(flat_params, revision)`` — one fragment's slice, or the
+        whole model when ``fragment`` is None (pull-only requests and the
+        P=1 legacy protocol, where fragment 0 IS the whole model).
         """
         with self._lock:
-            cache = self._snapshot_cache
-            if cache is not None:
-                return cache[1], cache[0]
-            snap = self._build_snapshot_locked()
+            if fragment is not None or self._num_fragments == 1:
+                return self._frag_snapshot_locked(fragment or 0), self._revision
             flat = torch.cat(
-                [snap[name].detach().reshape(-1).float() for name in self._param_names]
+                [
+                    self._frag_snapshot_locked(f)
+                    for f in range(self._num_fragments)
+                ]
             )
-            self._snapshot_cache = (self._revision, flat)
             return flat, self._revision
 
-    def _build_snapshot_locked(self) -> Dict[str, torch.Tensor]:
+    def _build_snapshot_locked(
+        self, names: List[str]
+    ) -> Dict[str, torch.Tensor]:
         """
-        Parameters to send back to workers. Must be called with ``self._lock``
-        held. Subclasses may override (e.g. HeLoCo's look-ahead shift).
+        Parameters to send back to workers, restricted to ``names`` (one
+        fragment's slice, or all parameters). Must be called with
+        ``self._lock`` held. Subclasses may override (e.g. HeLoCo's
+        look-ahead shift).
         """
-        return {name: p.data for name, p in self._model.named_parameters()}
+        return {name: self._params_by_name[name].data for name in names}
 
     # ------------------------------------------------------------------ #
     # Outer-step application                                              #
     # ------------------------------------------------------------------ #
 
-    def _commit_step_locked(self, grads: Dict[str, torch.Tensor]) -> None:
-        """Apply one outer step. Must be called with ``self._lock`` held."""
+    def _commit_step_locked(
+        self, grads: Dict[str, torch.Tensor], fragment: int = 0
+    ) -> None:
+        """Apply one outer step over exactly the parameters in ``grads`` (one
+        fragment's, or all of them). Must be called with ``self._lock`` held.
+
+        ``zero_grad()`` leaves every other parameter's ``.grad`` as None and
+        both outer optimizers skip None grads, so a single optimizer steps one
+        fragment natively — momentum is per-parameter state.
+        """
         with torch.no_grad():
-            for name, p in self._model.named_parameters():
-                p.grad = grads[name].to(p.dtype)
+            for name, g in grads.items():
+                p = self._params_by_name[name]
+                p.grad = g.to(p.dtype)
         self._outer_optimizer.step()
         self._outer_optimizer.zero_grad()
         self._revision += 1
         self._applied_pushes += 1
         self._last_step_time = time.time()
-        self._snapshot_cache = None
+        self._snapshot_cache.pop(fragment, None)
 
-    def _apply_one(self, pseudo_grads: Dict[str, torch.Tensor]) -> None:
+    def _apply_one(
+        self, pseudo_grads: Dict[str, torch.Tensor], fragment: int = 0
+    ) -> None:
         """
         Apply one worker's pseudo-gradient as one outer step. Subclasses may
         override to transform the gradient first (e.g. HeLoCo block
         correction) as long as they end with ``_commit_step_locked``.
         """
         with self._lock:
-            self._commit_step_locked(pseudo_grads)
+            self._commit_step_locked(pseudo_grads, fragment)
 
     def _record_speeds_locked(self, speeds: List[float]) -> None:
         """Add worker speeds to the DyLU pool. Must hold ``self._lock``."""
@@ -1023,6 +1191,7 @@ class AsyncDiLoCoServer:
         baseline_revision: int,
         flat_grads: Optional[torch.Tensor],
         pseudo_grads: Optional[Dict[str, torch.Tensor]] = None,
+        fragment: Optional[int] = None,
     ) -> Tuple[Dict[str, Any], torch.Tensor]:
         """
         Process one worker sync (transport-independent core; the HTTP handler
@@ -1035,6 +1204,11 @@ class AsyncDiLoCoServer:
         whose per-parameter dict already exists (the shared streaming buffers —
         caller holds ``_stream_lock`` for the duration of this call).
 
+        ``fragment`` scopes a fragment push: the gradients cover that
+        fragment's parameters and the returned ``flat_params`` is its slice.
+        ``None`` is a whole-model sync (the P=1 protocol, and every
+        pull-only request).
+
         Returns ``({"new_steps", "revision", "applied"}, flat_params)``.
         """
         applied = False
@@ -1042,7 +1216,7 @@ class AsyncDiLoCoServer:
             if pseudo_grads is None:
                 assert flat_grads is not None
                 # The HTTP handler already dequantized to fp32.
-                pseudo_grads = self._unflatten(flat_grads)
+                pseudo_grads = self._unflatten(flat_grads, fragment)
 
             with self._lock:
                 stale = baseline_revision > self._revision
@@ -1056,7 +1230,7 @@ class AsyncDiLoCoServer:
                     "(server restored from checkpoint?)"
                 )
                 new_steps = self._dylu_H
-                snapshot_flat, revision = self._snapshot_flat()
+                snapshot_flat, revision = self._snapshot_flat(fragment)
             elif self._grace_period > 0.0:
                 batch, i_am_processor = self._grace_accumulate_and_wait(
                     pseudo_grads, worker_speed
@@ -1097,9 +1271,9 @@ class AsyncDiLoCoServer:
                 with self._lock:
                     self._record_speeds_locked([worker_speed])
                     pool_speed = self._pool_speed_locked()
-                self._apply_one(pseudo_grads)
+                self._apply_one(pseudo_grads, fragment or 0)
                 applied = True
-                snapshot_flat, revision = self._snapshot_flat()
+                snapshot_flat, revision = self._snapshot_flat(fragment)
                 new_steps = self._dylu_steps(worker_speed, pool_speed)
                 self._maybe_checkpoint()
         else:
@@ -1123,6 +1297,20 @@ def _clone_tensors(obj: Any) -> Any:
     if isinstance(obj, tuple):
         return tuple(_clone_tensors(v) for v in obj)
     return obj
+
+
+@dataclasses.dataclass
+class _InflightPush:
+    """One background fragment exchange: launched at a fragment boundary,
+    joined and adopted at the NEXT boundary (Decoupled DiLoCo's overlap —
+    the roundtrip has a full fragment-window of inner steps to complete
+    before anything blocks on it). Exactly one is outstanding at a time."""
+
+    fragment: int
+    thread: Optional[threading.Thread] = None
+    # (flat_params, new_steps, revision, applied) from _session_roundtrip
+    result: Optional[Tuple[torch.Tensor, int, int, bool]] = None
+    error: Optional[BaseException] = None
 
 
 class AsyncDiLoCo:
@@ -1174,6 +1362,7 @@ class AsyncDiLoCo:
         sync_timeout: float = 60.0,
         busy_retries: int = 10,
         replica_pg: Optional[dist.ProcessGroup] = None,
+        num_fragments: int = 1,
     ) -> None:
         """
         Args:
@@ -1234,7 +1423,28 @@ class AsyncDiLoCo:
                 must construct and drive this object in lockstep (same
                 ``sync_every``, same step cadence). ``None`` (default) is the
                 single-process behavior, byte-for-byte.
+            num_fragments: Fragment-wise sync with communication overlap
+                (Decoupled DiLoCo, arXiv 2604.21428). ``sync_every`` stays the
+                FULL cycle: the model is split into this many contiguous,
+                numel-balanced fragments and every ``sync_every /
+                num_fragments`` inner steps ONE fragment (rotating) is pushed
+                in a BACKGROUND thread; its merged result is adopted at the
+                NEXT fragment boundary while the next fragment's exchange is
+                in flight — the roundtrip has a full fragment-window of steps
+                to complete before anything blocks on it. Requires
+                ``sync_every % num_fragments == 0`` and must match the
+                server's ``num_fragments``. 1 (default) is the legacy
+                synchronous whole-model sync, byte-for-byte.
         """
+        if num_fragments < 1:
+            raise ValueError(
+                f"num_fragments must be >= 1, got {num_fragments}"
+            )
+        if num_fragments > 1 and sync_every % num_fragments != 0:
+            raise ValueError(
+                f"sync_every ({sync_every}) must be divisible by "
+                f"num_fragments ({num_fragments})"
+            )
         self._server_address = server_address
         self._model = model
         self._inner_optimizer = inner_optimizer
@@ -1266,6 +1476,20 @@ class AsyncDiLoCo:
             p.numel() for _, p in model.named_parameters()
         ]
         self._total_numel: int = sum(self._param_numels)
+        # Fragment-wise sync state: the SAME deterministic partition the
+        # server derives (the wire carries only the fragment index).
+        self._num_fragments: int = num_fragments
+        self._frag_bounds: List[Tuple[int, int]] = _fragment_bounds(
+            self._param_numels, num_fragments
+        )
+        self._frag_numels: List[int] = [
+            sum(self._param_numels[a:b]) for a, b in self._frag_bounds
+        ]
+        self._frag_idx: int = 0
+        self._inflight: Optional[_InflightPush] = None
+        self._params_by_name: Dict[str, torch.Tensor] = dict(
+            model.named_parameters()
+        )
         # Full-model backup of the last-adopted global params: pseudo-gradients
         # are computed against it. Only the lead ever reads it, so followers
         # skip it entirely (a sharded rank couldn't cheaply fill it anyway).
@@ -1344,6 +1568,13 @@ class AsyncDiLoCo:
         traceback: Optional[TracebackType],
     ) -> bool:
         self._stop_heartbeat()
+        # Fragment mode: drain (never adopt) an in-flight exchange — the
+        # process is shutting down and replica followers couldn't join the
+        # adopt broadcast anyway; losing the final fragment window is the
+        # same cost as any dropped push.
+        inflight, self._inflight = self._inflight, None
+        if inflight is not None and inflight.thread is not None:
+            inflight.thread.join(timeout=self._sync_timeout)
         for hook in self._hooks:
             hook.remove()
         self._hooks.clear()
@@ -1383,7 +1614,10 @@ class AsyncDiLoCo:
         _kwargs: Dict[str, Any],
     ) -> None:
         self._local_step += 1
-        if self._local_step < self._sync_every:
+        # Fragment mode shortens the boundary cadence: one fragment syncs per
+        # sync_every/P window, so a full rotation still moves the whole model
+        # every sync_every steps (P=1: the legacy whole-model boundary).
+        if self._local_step < self._sync_every // self._num_fragments:
             return
 
         if self._replica_pg is not None:
@@ -1394,6 +1628,8 @@ class AsyncDiLoCo:
             # with backoff and keep training locally in the meantime.
             if time.monotonic() >= self._resync_at:
                 self._try_resync()
+        elif self._num_fragments > 1:
+            self._boundary_fragment()
         else:
             try:
                 self._sync()
@@ -1438,13 +1674,167 @@ class AsyncDiLoCo:
         )
 
     # ------------------------------------------------------------------ #
+    # Fragment-wise sync (num_fragments > 1): staggered rotation with     #
+    # overlapped communication (Decoupled DiLoCo, arXiv 2604.21428)       #
+    # ------------------------------------------------------------------ #
+
+    def _enter_resync(self) -> None:
+        """Schedule a pull-only whole-model re-baseline (fragment paths: a
+        failed or rejected fragment exchange invalidates the pipeline, and
+        the pull refreshes every fragment's baseline at once)."""
+        self._pending_resync = True
+        self._resync_backoff = 1.0
+        self._resync_at = time.monotonic()
+
+    def _window_speed(self) -> float:
+        """Inner steps/sec over the window just ended (0.0 right after a
+        resync — that window started from stale params, exclude it from
+        DyLU measurement)."""
+        if self._skip_speed_report:
+            self._skip_speed_report = False
+            return 0.0
+        elapsed = time.monotonic() - self._window_start
+        return self._local_step / elapsed if elapsed > 0 else 0.0
+
+    def _apply_dylu(self, new_steps: int) -> None:
+        """Adopt a DyLU window-length recommendation. ``new_steps`` always
+        means the FULL cycle; fragment mode rounds it to a multiple of P so
+        the boundary cadence stays integral."""
+        if new_steps > 0 and self._num_fragments > 1:
+            new_steps = max(
+                self._num_fragments,
+                new_steps // self._num_fragments * self._num_fragments,
+            )
+        if new_steps > 0 and new_steps != self._sync_every:
+            logger.info(
+                f"AsyncDiLoCo DyLU: sync_every updated "
+                f"{self._sync_every} → {new_steps}"
+            )
+            self._sync_every = new_steps
+
+    def _fragment_pseudo_grad(self, fragment: int) -> torch.Tensor:
+        """Δ = θ_baseline − θ_local over ONE fragment's parameters, flat fp32
+        CPU (the fragment-scoped form of :meth:`_sync`'s whole-model loop)."""
+        a, b = self._frag_bounds[fragment]
+        grad_chunks: List[torch.Tensor] = []
+        with torch.no_grad():
+            for name in self._param_names[a:b]:
+                local_cpu = self._params_by_name[name].detach().cpu()
+                grad_chunks.append(
+                    (self._global_params[name] - local_cpu).reshape(-1).float()
+                )
+        return torch.cat(grad_chunks)
+
+    def _launch_push(
+        self, fragment: int, speed: float, flat_grads: torch.Tensor
+    ) -> None:
+        """Start one fragment exchange in the background. The 503 busy-retry
+        loop lives inside _session_roundtrip and works unchanged there."""
+        inflight = _InflightPush(fragment=fragment)
+
+        def _run() -> None:
+            try:
+                inflight.result = self._session_roundtrip(
+                    flag=1.0, speed=speed, flat_grads=flat_grads,
+                    fragment=fragment,
+                )
+            except BaseException as exc:  # surfaced at join, never raised here
+                inflight.error = exc
+
+        inflight.thread = threading.Thread(
+            target=_run, daemon=True, name=f"asyncdiloco-push-f{fragment}"
+        )
+        self._inflight = inflight
+        inflight.thread.start()
+
+    def _join_and_adopt_inflight(self) -> bool:
+        """Join the outstanding fragment exchange (backpressure: blocks only
+        if the roundtrip was slower than one fragment-window of training) and
+        adopt its merged fragment. Returns False when this boundary must not
+        launch a new push (failure or rejection → whole-model resync)."""
+        inflight, self._inflight = self._inflight, None
+        if inflight is None:
+            return True  # first boundary of the pipeline: nothing in flight
+        inflight.thread.join()
+        if inflight.error is not None:
+            logger.warning(
+                "AsyncDiLoCo fragment sync failed; dropping push and "
+                "continuing local training (will resync): %s",
+                inflight.error,
+            )
+            self._enter_resync()
+            return False
+        flat_params, new_steps, revision, applied = inflight.result
+        if not applied:
+            # Stale baseline (server checkpoint restore): EVERY fragment's
+            # baseline is stale, so skip the fragment-sized response and
+            # re-baseline the whole model via the resync path.
+            logger.warning(
+                "AsyncDiLoCo fragment push rejected by server (baseline "
+                "revision %d); scheduling whole-model resync",
+                self._baseline_revision,
+            )
+            self._skip_speed_report = True
+            self._enter_resync()
+            return False
+        self._adopt_fragment(inflight.fragment, flat_params, revision, new_steps)
+        return True
+
+    def _adopt_fragment(
+        self,
+        fragment: int,
+        flat_params: torch.Tensor,
+        revision: int,
+        new_steps: int,
+    ) -> None:
+        """Install one merged fragment into the model and the baseline backup.
+
+        With ``fragment_update_alpha`` > 0 the merge lerps toward the
+        parameter's CURRENT local value — the steps trained while the
+        exchange was in flight — which is Streaming DiLoCo's merge semantics
+        (at P=1 push-time and adopt-time locals coincide, so this matches the
+        legacy blend exactly).
+        """
+        a, b = self._frag_bounds[fragment]
+        alpha = self._fragment_update_alpha
+        with torch.no_grad():
+            offset = 0
+            for name in self._param_names[a:b]:
+                p = self._params_by_name[name]
+                n = p.numel()
+                chunk = flat_params[offset : offset + n].view(p.shape)
+                offset += n
+                self._global_params[name].copy_(chunk)
+                if alpha > 0.0:
+                    local_prev = p.data.clone()
+                p.data.copy_(chunk.to(p.device))
+                if alpha > 0.0:
+                    p.data.lerp_(local_prev, alpha)
+        self._baseline_revision = revision
+        if self._reset_inner_state and fragment == self._num_fragments - 1:
+            # Opt-in reset keeps its once-per-full-cycle cadence.
+            self._inner_optimizer.state.clear()
+        self._apply_dylu(new_steps)
+
+    def _boundary_fragment(self) -> None:
+        """One fragment boundary (single-process): adopt the previous
+        fragment's merged result, then launch this fragment's exchange."""
+        if not self._join_and_adopt_inflight():
+            return
+        fragment = self._frag_idx
+        self._frag_idx = (fragment + 1) % self._num_fragments
+        speed = self._window_speed()
+        self._launch_push(fragment, speed, self._fragment_pseudo_grad(fragment))
+
+    # ------------------------------------------------------------------ #
     # Replica mode (replica_pg): one PS session per multi-rank replica    #
     # ------------------------------------------------------------------ #
 
     # Broadcast words (lead -> followers). Action picks the boundary branch;
-    # outcome picks the post-HTTP branch.
+    # outcome picks the post-HTTP branch. _OUT_NONE: fragment mode's first
+    # boundary — nothing in flight yet, nothing to adopt, proceed to launch.
     _ACT_SKIP, _ACT_SYNC, _ACT_RESYNC = 0, 1, 2
-    _OUT_FAIL, _OUT_ADOPT, _OUT_ADOPT_BLEND = 0, 1, 2
+    _OUT_FAIL, _OUT_ADOPT, _OUT_ADOPT_BLEND, _OUT_NONE = 0, 1, 2, 3
 
     def _bcast_words(self, words: List[int]) -> List[int]:
         """Broadcast small control integers from the lead. Every branch the
@@ -1472,7 +1862,10 @@ class AsyncDiLoCo:
                 act = self._ACT_SYNC
         (act,) = self._bcast_words([act])
         if act == self._ACT_SYNC:
-            self._sync_replica()
+            if self._num_fragments > 1:
+                self._boundary_fragment_replica()
+            else:
+                self._sync_replica()
         elif act == self._ACT_RESYNC:
             self._resync_replica()
 
@@ -1556,6 +1949,124 @@ class AsyncDiLoCo:
                 blend_local if outcome == self._OUT_ADOPT_BLEND else None,
             )
 
+    def _boundary_fragment_replica(self) -> None:
+        """One fragment boundary in replica mode. Phase 1 joins and adopts
+        the previous fragment's exchange (every branch keys off broadcast
+        words — per-rank decisions would diverge and deadlock the next
+        collective). Phase 2 gathers this fragment's pseudo-gradient with
+        collectives on the MAIN thread, then only the lead's HTTP roundtrip
+        runs in the background."""
+        out, new_steps, frag_prev = self._OUT_NONE, 0, 0
+        revision = 0
+        flat_params: Optional[torch.Tensor] = None
+        if self._is_lead:
+            inflight, self._inflight = self._inflight, None
+            if inflight is not None:
+                inflight.thread.join()
+                frag_prev = inflight.fragment
+                if inflight.error is not None:
+                    logger.warning(
+                        "AsyncDiLoCo fragment sync failed; dropping push and "
+                        "continuing local training (will resync): %s",
+                        inflight.error,
+                    )
+                    self._enter_resync()
+                    out = self._OUT_FAIL
+                else:
+                    flat_params, new_steps, revision, applied = inflight.result
+                    if applied:
+                        out = self._OUT_ADOPT
+                    else:
+                        logger.warning(
+                            "AsyncDiLoCo fragment push rejected by server "
+                            "(baseline revision %d); scheduling whole-model "
+                            "resync",
+                            self._baseline_revision,
+                        )
+                        self._skip_speed_report = True
+                        self._enter_resync()
+                        out = self._OUT_FAIL
+        out, new_steps, frag_prev = self._bcast_words(
+            [out, new_steps, frag_prev]
+        )
+        if out == self._OUT_ADOPT:
+            self._adopt_replica_fragment(
+                frag_prev, flat_params, revision, new_steps
+            )
+        elif out == self._OUT_FAIL:
+            return  # the resync path takes over at the next boundary
+
+        fragment = self._frag_idx
+        self._frag_idx = (fragment + 1) % self._num_fragments
+        a, b = self._frag_bounds[fragment]
+        grad_chunks: List[torch.Tensor] = []
+        with torch.no_grad():
+            for name in self._param_names[a:b]:
+                # Collective for sharded params — every rank participates in
+                # the same order, only the lead consumes the value.
+                full = _full_value(self._params_by_name[name])
+                if self._is_lead:
+                    grad_chunks.append(
+                        (self._global_params[name] - full.detach().cpu())
+                        .reshape(-1)
+                        .float()
+                    )
+                del full
+        if self._is_lead:
+            self._launch_push(
+                fragment, self._window_speed(), torch.cat(grad_chunks)
+            )
+
+    def _adopt_replica_fragment(
+        self,
+        fragment: int,
+        flat_params: Optional[torch.Tensor],
+        revision: int,
+        new_steps: int,
+    ) -> None:
+        """Fragment-scoped :meth:`_adopt_replica`: broadcast the merged
+        fragment parameter-by-parameter; each rank installs its own slice.
+        Blend (alpha > 0) lerps toward the rank's CURRENT local shard — the
+        in-flight training progress (see :meth:`_adopt_fragment`)."""
+        alpha = self._fragment_update_alpha
+        a, b = self._frag_bounds[fragment]
+        with torch.no_grad():
+            offset = 0
+            for name in self._param_names[a:b]:
+                p = self._params_by_name[name]
+                numel = p.numel()
+                shape = tuple(p.shape)
+                if self._is_lead:
+                    full = flat_params[offset : offset + numel].view(shape)
+                else:
+                    full = torch.empty(shape, dtype=torch.float32)
+                offset += numel
+                dist.broadcast(
+                    full, src=self._lead_rank, group=self._replica_pg
+                )
+                if isinstance(p, DTensor):
+                    local = p.to_local()
+                    chunk = (
+                        full
+                        if tuple(local.shape) == shape
+                        else full[_local_shard_slices(p)]
+                    )
+                else:
+                    local, chunk = p.data, full
+                if alpha > 0.0:
+                    prev = local.clone()
+                local.copy_(chunk)
+                if alpha > 0.0:
+                    local.lerp_(prev, alpha)
+                if self._is_lead:
+                    self._global_params[name].copy_(full)
+                del full
+        if self._is_lead:
+            self._baseline_revision = revision
+        if self._reset_inner_state and fragment == self._num_fragments - 1:
+            self._inner_optimizer.state.clear()
+        self._apply_dylu(new_steps)
+
     def _resync_replica(self) -> None:
         """Replica-mode :meth:`_try_resync`: pull-only re-baseline; backoff
         state lives on the lead alone."""
@@ -1637,11 +2148,7 @@ class AsyncDiLoCo:
             self._inner_optimizer.state.clear()
         # DyLU: new_steps arrives via the outcome broadcast, so every rank
         # moves to the same window length on the same boundary.
-        if new_steps > 0 and new_steps != self._sync_every:
-            logger.info(
-                f"AsyncDiLoCo DyLU: sync_every updated {self._sync_every} → {new_steps}"
-            )
-            self._sync_every = new_steps
+        self._apply_dylu(new_steps)
 
     def _pull_global_replica(self) -> None:
         """Replica-mode pull: failure raises on EVERY rank (so __enter__
@@ -1670,11 +2177,22 @@ class AsyncDiLoCo:
     # ------------------------------------------------------------------ #
 
     def _session_roundtrip(
-        self, flag: float, speed: float, flat_grads: Optional[torch.Tensor]
+        self,
+        flag: float,
+        speed: float,
+        flat_grads: Optional[torch.Tensor],
+        fragment: Optional[int] = None,
     ) -> Tuple[torch.Tensor, int, int, bool]:
         """
         One push/pull cycle: a single HTTP POST to the server's /sync
         endpoint (see :class:`AsyncDiLoCoServer` for the wire format).
+        ``fragment`` scopes the push (and the returned params) to one
+        fragment's slice; pull-only requests are always whole-model.
+
+        Fragment mode runs this on a background thread — it only reads
+        construction-time state plus ``_baseline_revision`` (an int read,
+        benign against the main thread's adopt), and exactly one exchange is
+        in flight at a time.
 
         Returns ``(flat_params, new_steps, revision, applied)``.
         """
@@ -1683,11 +2201,22 @@ class AsyncDiLoCo:
             "speed": speed,
             "baseline_revision": self._baseline_revision,
         }
+        expected_numel = (
+            self._total_numel
+            if fragment is None
+            else self._frag_numels[fragment]
+        )
         body = b""
         if flat_grads is not None:
             header["numel"] = flat_grads.numel()
+            numels = self._param_numels
+            if fragment is not None:
+                header["fragment"] = fragment
+                header["num_fragments"] = self._num_fragments
+                a, b = self._frag_bounds[fragment]
+                numels = self._param_numels[a:b]
             if self._quantize:
-                q, scales = _quantize_int8(flat_grads, self._param_numels)
+                q, scales = _quantize_int8(flat_grads, numels)
                 header["dtype"] = "int8"
                 body = _tensor_to_bytes(scales) + _tensor_to_bytes(q)
             else:
@@ -1716,10 +2245,10 @@ class AsyncDiLoCo:
                 ) as resp:
                     resp_header = json.loads(resp.readline(_MAX_HEADER_BYTES))
                     numel = int(resp_header["numel"])
-                    if numel != self._total_numel:
+                    if numel != expected_numel:
                         raise ValueError(
                             f"global param numel mismatch: got {numel}, "
-                            f"expected {self._total_numel} — model/server mismatch?"
+                            f"expected {expected_numel} — model/server mismatch?"
                         )
                     flat_params = _bytes_to_tensor(
                         _read_exact(resp, numel * 4), torch.float32
@@ -1777,11 +2306,7 @@ class AsyncDiLoCo:
             # across windows); see the constructor docstring.
             self._inner_optimizer.state.clear()
 
-        if new_steps > 0 and new_steps != self._sync_every:
-            logger.info(
-                f"AsyncDiLoCo DyLU: sync_every updated {self._sync_every} → {new_steps}"
-            )
-            self._sync_every = new_steps
+        self._apply_dylu(new_steps)
 
     def _pull_global(self) -> None:
         """Pull current global params (flag=0) and adopt them wholesale."""

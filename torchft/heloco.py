@@ -216,8 +216,9 @@ class HeLoCoServer(AsyncDiLoCoServer):
         super().__init__(model=model, outer_optimizer=outer_optimizer, **kwargs)
 
     @torch.profiler.record_function("heloco.lookahead_snapshot")
-    def _lookahead_snapshot(self) -> Dict[str, torch.Tensor]:
-        """Compute θ̄ = θ − η·μ·m for each parameter (Eq. 5). Must hold self._lock."""
+    def _lookahead_snapshot(self, names: List[str]) -> Dict[str, torch.Tensor]:
+        """Compute θ̄ = θ − η·μ·m (Eq. 5) for the parameters in ``names`` —
+        one fragment's slice, or all of them. Must hold self._lock."""
         param_to_hyper: Dict[int, Tuple[float, float]] = {}
         for group in self._outer_optimizer.param_groups:
             lr: float = group["lr"]
@@ -229,7 +230,8 @@ class HeLoCoServer(AsyncDiLoCoServer):
         # Group by lr*mu so _foreach_sub can process all params in one C++ call.
         scale_groups: Dict[float, List[Tuple[str, torch.nn.Parameter, torch.Tensor]]] = defaultdict(list)
 
-        for name, p in self._model.named_parameters():
+        for name in names:
+            p = self._params_by_name[name]
             state = self._outer_optimizer.state.get(p)
             m = state["m"] if (state and "m" in state) else None
             lr, mu = param_to_hyper.get(id(p), (0.0, 0.0))
@@ -246,22 +248,31 @@ class HeLoCoServer(AsyncDiLoCoServer):
 
         return snapshot
 
-    def _build_snapshot_locked(self) -> Dict[str, torch.Tensor]:
+    def _build_snapshot_locked(self, names: List[str]) -> Dict[str, torch.Tensor]:
         # Workers always receive the look-ahead position θ̄, never raw θ.
-        return self._lookahead_snapshot()
+        return self._lookahead_snapshot(names)
 
     @torch.profiler.record_function("heloco.apply")
-    def _apply_one(self, pseudo_grads: Dict[str, torch.Tensor]) -> None:
+    def _apply_one(
+        self, pseudo_grads: Dict[str, torch.Tensor], fragment: int = 0
+    ) -> None:
         """Block-correct one worker's pseudo-gradient, then commit the outer step.
 
         Clone momentum (brief lock) → block_correct (no lock) → commit (lock).
         Sequential grace-batch workers therefore each correct against the
         momentum updated by the previous worker's step (paper Algorithm 2
         ordering).
+
+        Momentum is cloned only for the parameters this push covers
+        (``pseudo_grads`` keys — one fragment's slice under fragment-wise
+        sync, which also shrinks the per-push clone to model/P). Block
+        correction is per-parameter, so a fragment push corrects and commits
+        bitwise the same values a whole-model push of the same deltas would.
         """
         with self._lock:
             mom_bufs: Dict[str, Optional[torch.Tensor]] = {}
-            for name, p in self._model.named_parameters():
+            for name in pseudo_grads:
+                p = self._params_by_name[name]
                 state = self._outer_optimizer.state.get(p)
                 m = state["m"] if (state and "m" in state) else None
                 mom_bufs[name] = m.clone() if m is not None else None
@@ -280,7 +291,7 @@ class HeLoCoServer(AsyncDiLoCoServer):
         )
 
         with self._lock:
-            self._commit_step_locked(corrected)
+            self._commit_step_locked(corrected, fragment)
 
 
 # Workers are standard AsyncDiLoCo — all HeLoCo logic lives on the server.
