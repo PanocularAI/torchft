@@ -94,28 +94,35 @@ def _read_exact(stream: BinaryIO, nbytes: int) -> bytearray:
     workers (panofabric docs/heloco-ps-memory.md).
     """
     buf = bytearray(nbytes)
-    view = memoryview(buf)
+    _read_exact_into(stream, memoryview(buf))
+    return buf
+
+
+def _read_exact_into(stream: BinaryIO, view: memoryview) -> None:
+    """Fill ``view`` completely from ``stream`` or raise on early EOF.
+
+    The zero-copy core of :func:`_read_exact` — and, given a memoryview over a
+    tensor's own storage, the streaming request path's way of landing wire bytes
+    DIRECTLY in their destination buffer with no intermediate allocation at all.
+    """
+    nbytes = view.nbytes
     off = 0
     # readinto avoids materializing each chunk; every stream we use here
     # (http.server's rfile, http.client's HTTPResponse) is a BufferedIOBase.
     readinto = getattr(stream, "readinto", None)
-    try:
-        while off < nbytes:
-            if readinto is not None:
-                n = readinto(view[off:])
-            else:  # pragma: no cover - test doubles / exotic streams
-                chunk = stream.read(nbytes - off)
-                n = len(chunk)
-                if n:
-                    view[off : off + n] = chunk
-            if not n:
-                raise IOError(
-                    f"connection closed after {off}/{nbytes} payload bytes"
-                )
-            off += n
-    finally:
-        view.release()
-    return buf
+    while off < nbytes:
+        if readinto is not None:
+            n = readinto(view[off:])
+        else:  # pragma: no cover - test doubles / exotic streams
+            chunk = stream.read(nbytes - off)
+            n = len(chunk)
+            if n:
+                view[off : off + n] = chunk
+        if not n:
+            raise IOError(
+                f"connection closed after {off}/{nbytes} payload bytes"
+            )
+        off += n
 
 
 def _tensor_to_bytes(t: torch.Tensor) -> bytes:
@@ -466,6 +473,17 @@ class AsyncDiLoCoServer:
         self._advertise_host: str = _resolve_advertise_host(advertise_host)
         self._session_slots = threading.BoundedSemaphore(max_sessions)
         self._shutdown_event = threading.Event()
+        # Streaming request path (grace_period == 0 only): pushes are read
+        # chunk-by-chunk into ONE persistent, lazily-allocated buffer set instead
+        # of fresh whole-model allocations per push. The buffers are shared, so
+        # read+apply is serialized by this lock; that bounds the server's
+        # per-push memory at ONE model copy total — independent of how many
+        # workers push concurrently — at the cost of queueing uploads, a bounded
+        # delay HeLoCo's staleness tolerance absorbs (it is also exactly what
+        # max_sessions=1 would impose). Grace batching needs private per-worker
+        # gradients, so it keeps the materializing path.
+        self._stream_lock = threading.Lock()
+        self._stream_bufs: Optional[Dict[str, torch.Tensor]] = None
 
         server_ref = self
 
@@ -490,6 +508,15 @@ class AsyncDiLoCoServer:
                     )
                     is_full_sync = bool(header["flag"])
                     flat_grads: Optional[torch.Tensor] = None
+                    stream_bufs: Optional[Dict[str, torch.Tensor]] = None
+                    # Streaming read (grace off): land the body in the shared
+                    # persistent buffers instead of fresh whole-model
+                    # allocations — see _stream_body_into_bufs. Grace batching
+                    # holds several workers' gradients at once, so it keeps the
+                    # materializing read below.
+                    use_streaming = (
+                        is_full_sync and server_ref._grace_period == 0.0
+                    )
                     if is_full_sync:
                         wire_dtype = header.get("dtype", "float32")
                         numel = int(header["numel"])
@@ -498,7 +525,9 @@ class AsyncDiLoCoServer:
                                 f"pseudo-gradient numel mismatch: got {numel}, "
                                 f"expected {server_ref._total_numel}"
                             )
-                        if wire_dtype == "int8":
+                        if use_streaming:
+                            pass  # body is read under the stream lock below
+                        elif wire_dtype == "int8":
                             scales = _bytes_to_tensor(
                                 _read_exact(
                                     self.rfile,
@@ -522,21 +551,51 @@ class AsyncDiLoCoServer:
                                 f"unsupported wire dtype {wire_dtype!r}"
                             )
 
-                    resp, snapshot_flat = server_ref._handle_sync(
-                        is_full_sync=is_full_sync,
-                        worker_speed=float(header.get("speed", 0.0)),
-                        baseline_revision=int(
-                            header.get("baseline_revision", 0)
-                        ),
-                        flat_grads=flat_grads,
-                    )
+                    if use_streaming:
+                        # Shared buffers: read + apply as one exclusive
+                        # section. The lock is released before the response is
+                        # written — the snapshot is an immutable per-revision
+                        # copy, so a slow reader can't stall the next apply.
+                        with server_ref._stream_lock:
+                            stream_bufs = server_ref._stream_body_into_bufs(
+                                self.rfile, wire_dtype
+                            )
+                            resp, snapshot_flat = server_ref._handle_sync(
+                                is_full_sync=is_full_sync,
+                                worker_speed=float(header.get("speed", 0.0)),
+                                baseline_revision=int(
+                                    header.get("baseline_revision", 0)
+                                ),
+                                flat_grads=None,
+                                pseudo_grads=stream_bufs,
+                            )
+                    else:
+                        resp, snapshot_flat = server_ref._handle_sync(
+                            is_full_sync=is_full_sync,
+                            worker_speed=float(header.get("speed", 0.0)),
+                            baseline_revision=int(
+                                header.get("baseline_revision", 0)
+                            ),
+                            flat_grads=flat_grads,
+                        )
 
                     resp["numel"] = snapshot_flat.numel()
                     head = (json.dumps(resp) + "\n").encode()
-                    payload = _tensor_to_bytes(snapshot_flat)
+                    # Zero-copy body: a memoryview over the snapshot's own
+                    # storage. _tensor_to_bytes here (.numpy().tobytes()) would
+                    # duplicate the whole-model response (2.2 GiB at 0.6B) per
+                    # in-flight reply. The snapshot is a per-revision immutable
+                    # copy (torch.cat output, cached in _snapshot_flat), so
+                    # writing from it directly is safe even after the cache
+                    # moves on — our reference keeps this revision alive.
+                    payload = memoryview(
+                        snapshot_flat.contiguous().numpy()
+                    ).cast("B")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Length", str(len(head) + len(payload)))
+                    self.send_header(
+                        "Content-Length", str(len(head) + payload.nbytes)
+                    )
                     self.end_headers()
                     self.wfile.write(head)
                     self.wfile.write(payload)
@@ -753,6 +812,46 @@ class AsyncDiLoCoServer:
     # Flat-buffer helpers (R1: one coalesced transfer per direction)      #
     # ------------------------------------------------------------------ #
 
+    def _stream_body_into_bufs(
+        self, rfile: BinaryIO, wire_dtype: str
+    ) -> Dict[str, torch.Tensor]:
+        """Read one push's body parameter-by-parameter into the persistent
+        streaming buffers, returning them shaped like :meth:`_unflatten`'s dict.
+
+        Caller must hold ``self._stream_lock`` (the buffers are shared) and have
+        validated the header's numel. The values produced are BITWISE IDENTICAL
+        to the materializing path: fp32 bytes land directly in the destination
+        via readinto, and the int8 path applies the same per-parameter-block
+        ``q.float() * scale`` that ``_dequantize_int8`` does — only the buffer
+        they land in changes, from a fresh whole-model allocation per push to
+        one reused set. Peak transient drops from O(model) per concurrent push
+        to O(largest parameter) on the int8 path and O(socket chunk) on fp32.
+        """
+        if self._stream_bufs is None:
+            self._stream_bufs = {
+                name: torch.empty(shape, dtype=torch.float32)
+                for name, shape in zip(self._param_names, self._param_shapes)
+            }
+        bufs = self._stream_bufs
+        if wire_dtype == "int8":
+            scales = _bytes_to_tensor(
+                _read_exact(rfile, len(self._param_numels) * 4), torch.float32
+            )
+            for i, (name, n) in enumerate(
+                zip(self._param_names, self._param_numels)
+            ):
+                q = _bytes_to_tensor(_read_exact(rfile, n), torch.int8)
+                torch.mul(q.float(), scales[i], out=bufs[name].view(-1))
+        elif wire_dtype == "float32":
+            for name in self._param_names:
+                flat = bufs[name].view(-1)
+                _read_exact_into(
+                    rfile, memoryview(flat.numpy()).cast("B")
+                )
+        else:
+            raise ValueError(f"unsupported wire dtype {wire_dtype!r}")
+        return bufs
+
     def _unflatten(self, flat: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Split one flat buffer into per-parameter views (no copies)."""
         out: Dict[str, torch.Tensor] = {}
@@ -923,6 +1022,7 @@ class AsyncDiLoCoServer:
         worker_speed: float,
         baseline_revision: int,
         flat_grads: Optional[torch.Tensor],
+        pseudo_grads: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[Dict[str, Any], torch.Tensor]:
         """
         Process one worker sync (transport-independent core; the HTTP handler
@@ -931,13 +1031,18 @@ class AsyncDiLoCoServer:
         Subclasses reuse this unchanged and customize behavior via
         :meth:`_apply_one` and :meth:`_build_snapshot_locked`.
 
+        ``pseudo_grads`` short-circuits the unflatten for the streaming path,
+        whose per-parameter dict already exists (the shared streaming buffers —
+        caller holds ``_stream_lock`` for the duration of this call).
+
         Returns ``({"new_steps", "revision", "applied"}, flat_params)``.
         """
         applied = False
         if is_full_sync:
-            assert flat_grads is not None
-            # The HTTP handler already dequantized to fp32.
-            pseudo_grads = self._unflatten(flat_grads)
+            if pseudo_grads is None:
+                assert flat_grads is not None
+                # The HTTP handler already dequantized to fp32.
+                pseudo_grads = self._unflatten(flat_grads)
 
             with self._lock:
                 stale = baseline_revision > self._revision

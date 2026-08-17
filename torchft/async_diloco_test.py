@@ -102,6 +102,35 @@ def push_pull(
     )
 
 
+def push_pull_flat(addr, flat, *, quantize, numels):
+    """One raw-protocol full-sync push of an ARBITRARY flat pseudo-gradient
+    (push_pull only supports a constant fill value). Drains and discards the
+    response body; returns the response header dict."""
+    header = {
+        "flag": 1,
+        "speed": 1.0,
+        "baseline_revision": 0,
+        "numel": flat.numel(),
+    }
+    if quantize:
+        q, scales = _quantize_int8(flat, numels)
+        header["dtype"] = "int8"
+        body = scales.numpy().tobytes() + q.numpy().tobytes()
+    else:
+        header["dtype"] = "float32"
+        body = flat.numpy().tobytes()
+    request = urllib.request.Request(
+        addr,
+        data=(json.dumps(header) + "\n").encode() + body,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as resp:
+        resp_header = json.loads(resp.readline())
+        resp.read()
+    return resp_header
+
+
 class TestDelayedNesterovOptimizer(TestCase):
     def test_period1_matches_standard_nesterov(self) -> None:
         """nesterov_period=1: every push is a milestone, should match SGD+Nesterov exactly."""
@@ -325,6 +354,117 @@ class TestAsyncDiLoCoServer(TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             ad._session_roundtrip(1.0, 1.0, torch.zeros(_total_numel(worker)))
         self.assertEqual(ctx.exception.code, 503)
+
+    def test_streamed_apply_is_bitwise_identical_to_materialized(self) -> None:
+        """THE safety proof for the streaming request path (heloco-ps-memory §6
+        step 3): reading a push chunk-by-chunk into the persistent buffers must
+        change WHERE bytes land, never their values. Same pushes through HTTP
+        (streaming) and through _handle_sync with a materialized flat tensor
+        (the old path, still used by grace batching) must yield bitwise-equal
+        global params, momentum, and response — across both server classes
+        (HeLoCo adds per-block norm/dot corrections that are NOT element-wise,
+        which is exactly why streaming reuses the whole materialized dict
+        instead of applying chunk-by-chunk) and both wire dtypes."""
+        from torchft.heloco import HeLoCoOptimizer, HeLoCoServer
+
+        def build(kind: str):
+            torch.manual_seed(1234)   # identical initial weights per build
+            model = _make_model()
+            if kind == "heloco":
+                opt = HeLoCoOptimizer(model.parameters(), lr=0.1, momentum=0.9)
+                return HeLoCoServer(model, opt, port=0), model
+            opt = DelayedNesterovOptimizer(
+                model.parameters(), lr=0.1, momentum=0.9, nesterov_period=2
+            )
+            return AsyncDiLoCoServer(model, opt, port=0), model
+
+        for kind in ("base", "heloco"):
+            for quantize in (False, True):
+                with self.subTest(kind=kind, quantize=quantize):
+                    streamed_srv, streamed_model = build(kind)
+                    self.addCleanup(streamed_srv.shutdown)
+                    reference_srv, reference_model = build(kind)
+                    self.addCleanup(reference_srv.shutdown)
+
+                    torch.manual_seed(99)
+                    total = _total_numel(streamed_model)
+                    pushes = [torch.randn(total) for _ in range(3)]
+
+                    for flat in pushes:
+                        if quantize:
+                            # The materialized reference must see the SAME
+                            # dequantized values the wire delivers.
+                            numels = [
+                                p.numel()
+                                for p in reference_model.parameters()
+                            ]
+                            q, scales = _quantize_int8(flat, numels)
+                            ref_flat = _dequantize_int8(q, scales, numels)
+                        else:
+                            ref_flat = flat.clone()
+                        reference_srv._handle_sync(
+                            is_full_sync=True,
+                            worker_speed=1.0,
+                            baseline_revision=0,
+                            flat_grads=ref_flat,
+                        )
+                        # HTTP => the streaming read path (grace_period == 0).
+                        push_pull_flat(
+                            streamed_srv.address(), flat, quantize=quantize,
+                            numels=[p.numel() for p in streamed_model.parameters()],
+                        )
+
+                    # Global params bitwise equal...
+                    for (n, ps), (_, pr) in zip(
+                        streamed_model.named_parameters(),
+                        reference_model.named_parameters(),
+                    ):
+                        self.assertTrue(
+                            torch.equal(ps.data, pr.data),
+                            f"{kind}/{quantize}: params diverged at {n}",
+                        )
+                    # ...and so is the outer-optimizer momentum.
+                    for ps, pr in zip(
+                        streamed_model.parameters(),
+                        reference_model.parameters(),
+                    ):
+                        ms = streamed_srv._outer_optimizer.state.get(ps, {}).get("m")
+                        mr = reference_srv._outer_optimizer.state.get(pr, {}).get("m")
+                        self.assertEqual(ms is None, mr is None)
+                        if ms is not None:
+                            self.assertTrue(torch.equal(ms, mr))
+                    # And the servers agree they applied the same pushes.
+                    self.assertEqual(
+                        streamed_srv._applied_pushes,
+                        reference_srv._applied_pushes,
+                    )
+
+    def test_grace_batching_still_uses_private_gradients(self) -> None:
+        """grace_period > 0 must keep the materializing path: batching holds
+        SEVERAL workers' gradients at once, which the single shared streaming
+        buffer cannot represent — routing it through streaming would silently
+        merge concurrent workers' pushes into one buffer."""
+        model = _make_model()
+        server = AsyncDiLoCoServer(
+            model, optim.SGD(model.parameters(), lr=0.1), port=0,
+            grace_period=0.2,
+        )
+        self.addCleanup(server.shutdown)
+        results: list = []
+
+        def worker(v: float) -> None:
+            results.append(push_pull(server.address(), model, grad_value=v))
+
+        threads = [threading.Thread(target=worker, args=(v,)) for v in (1.0, 2.0)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(len(results), 2)
+        # Both pushes applied as distinct gradients: revision advanced by 2.
+        self.assertEqual(server._revision, 2)
+        # And streaming buffers were never allocated on this server.
+        self.assertIsNone(server._stream_bufs)
 
     def test_stale_baseline_rejected(self) -> None:
         """A push whose baseline revision is ahead of the server (checkpoint-restore
