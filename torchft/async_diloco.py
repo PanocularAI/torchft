@@ -21,11 +21,12 @@ import os
 import socket
 import threading
 import time
+import urllib.error   # HTTPError: the 503 busy-retry path in _session_roundtrip
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler
 from types import TracebackType
-from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Type
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Type, Union
 from urllib.parse import parse_qs, urlparse
 
 import torch
@@ -78,26 +79,62 @@ def _local_shard_slices(p: "DTensor") -> Tuple[slice, ...]:
     return tuple(slice(o, o + s) for o, s in zip(offset, shape))
 
 
-def _read_exact(stream: BinaryIO, nbytes: int) -> bytes:
-    """Read exactly ``nbytes`` from a stream or raise on early EOF."""
-    buf = bytearray()
-    while len(buf) < nbytes:
-        chunk = stream.read(nbytes - len(buf))
-        if not chunk:
-            raise IOError(
-                f"connection closed after {len(buf)}/{nbytes} payload bytes"
-            )
-        buf.extend(chunk)
-    return bytes(buf)
+def _read_exact(stream: BinaryIO, nbytes: int) -> bytearray:
+    """Read exactly ``nbytes`` from a stream or raise on early EOF.
+
+    Returns a WRITABLE bytearray of exactly ``nbytes``, filled in place, so
+    :func:`_bytes_to_tensor` can wrap it with no copy at all.
+
+    This matters because these payloads are whole-model-sized: a pseudo-gradient
+    is 2.2 GiB fp32 for a 0.6B model, ~30 GiB for an 8B one. The previous
+    grow-then-freeze form (``bytearray()`` + ``extend`` + ``bytes(buf)``) paid
+    THREE full-size allocations per in-flight push on the parameter server — the
+    growth buffer, the immutable copy, and then another bytearray inside
+    _bytes_to_tensor — which is a large part of why a cloud PS OOM'd with two
+    workers (panofabric docs/heloco-ps-memory.md).
+    """
+    buf = bytearray(nbytes)
+    view = memoryview(buf)
+    off = 0
+    # readinto avoids materializing each chunk; every stream we use here
+    # (http.server's rfile, http.client's HTTPResponse) is a BufferedIOBase.
+    readinto = getattr(stream, "readinto", None)
+    try:
+        while off < nbytes:
+            if readinto is not None:
+                n = readinto(view[off:])
+            else:  # pragma: no cover - test doubles / exotic streams
+                chunk = stream.read(nbytes - off)
+                n = len(chunk)
+                if n:
+                    view[off : off + n] = chunk
+            if not n:
+                raise IOError(
+                    f"connection closed after {off}/{nbytes} payload bytes"
+                )
+            off += n
+    finally:
+        view.release()
+    return buf
 
 
 def _tensor_to_bytes(t: torch.Tensor) -> bytes:
     return t.detach().contiguous().cpu().numpy().tobytes()
 
 
-def _bytes_to_tensor(data: bytes, dtype: torch.dtype) -> torch.Tensor:
-    # bytearray gives torch a writable, owned buffer (frombuffer keeps a ref).
-    return torch.frombuffer(bytearray(data), dtype=dtype)
+def _bytes_to_tensor(
+    data: Union[bytes, bytearray], dtype: torch.dtype
+) -> torch.Tensor:
+    """Wrap a buffer as a tensor, WITHOUT copying when the buffer allows it.
+
+    ``torch.frombuffer`` needs a writable buffer and keeps a reference to it, so
+    a bytearray (what :func:`_read_exact` now returns) is wrapped in place — the
+    payload is never duplicated. Immutable ``bytes`` still has to be copied;
+    only callers holding literal payloads (tests) pass those.
+    """
+    if not isinstance(data, bytearray):
+        data = bytearray(data)
+    return torch.frombuffer(data, dtype=dtype)
 
 
 def _quantize_int8(
@@ -1030,6 +1067,7 @@ class AsyncDiLoCo:
         reset_inner_state: bool = False,
         resync_backoff_max: float = 60.0,
         sync_timeout: float = 60.0,
+        busy_retries: int = 10,
         replica_pg: Optional[dist.ProcessGroup] = None,
     ) -> None:
         """
@@ -1069,6 +1107,13 @@ class AsyncDiLoCo:
             sync_timeout: Socket timeout in seconds for each sync request.
                 Must exceed the server's ``grace_period`` (the server holds
                 the response while aggregating the batch). Defaults to 60 s.
+            busy_retries: How many times to re-send a push the server refused
+                with 503 (all ``max_sessions`` slots busy), waiting the
+                advertised ``Retry-After`` between attempts. Retrying is what
+                makes a session cap safe: without it the refusal reaches the
+                sync catch-all, which DROPS the push and re-baselines, losing
+                the window's pseudo-gradient. Set 0 to restore that old
+                behavior.
             replica_pg: REPLICA MODE — a (gloo) process group spanning every
                 rank of one multi-GPU/multi-node replica whose model may be
                 DTensor-sharded (FSDP/TP/2-D; never pipeline-split — PP
@@ -1143,6 +1188,7 @@ class AsyncDiLoCo:
         self._resync_at: float = 0.0
         self._resync_backoff: float = 1.0
         self._resync_backoff_max: float = resync_backoff_max
+        self._busy_retries: int = busy_retries
         # The window right after a resync started from stale params and an
         # unusual boundary — exclude it from DyLU speed measurement.
         self._skip_speed_report: bool = False
@@ -1543,23 +1589,53 @@ class AsyncDiLoCo:
                 header["dtype"] = "float32"
                 body = _tensor_to_bytes(flat_grads)
 
-        request = urllib.request.Request(
-            self._server_address,
-            data=(json.dumps(header) + "\n").encode() + body,
-            headers={"Content-Type": "application/octet-stream"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self._sync_timeout) as resp:
-            resp_header = json.loads(resp.readline(_MAX_HEADER_BYTES))
-            numel = int(resp_header["numel"])
-            if numel != self._total_numel:
-                raise ValueError(
-                    f"global param numel mismatch: got {numel}, "
-                    f"expected {self._total_numel} — model/server mismatch?"
-                )
-            flat_params = _bytes_to_tensor(
-                _read_exact(resp, numel * 4), torch.float32
+        payload = (json.dumps(header) + "\n").encode() + body
+
+        # 503 means "all session slots busy, come back" (the server's
+        # max_sessions semaphore), NOT a failure: WAIT AND RETRY THE SAME PUSH.
+        # Letting it escape would reach _step_post_hook's catch-all, which drops
+        # the push and re-baselines — throwing away the whole window's
+        # pseudo-gradient. That turns a capped-concurrency server (the memory fix
+        # for a central PS) into silent training loss, so the cap is only safe
+        # with this retry. Every other error still propagates untouched.
+        for attempt in range(self._busy_retries + 1):
+            request = urllib.request.Request(
+                self._server_address,
+                data=payload,
+                headers={"Content-Type": "application/octet-stream"},
+                method="POST",
             )
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=self._sync_timeout
+                ) as resp:
+                    resp_header = json.loads(resp.readline(_MAX_HEADER_BYTES))
+                    numel = int(resp_header["numel"])
+                    if numel != self._total_numel:
+                        raise ValueError(
+                            f"global param numel mismatch: got {numel}, "
+                            f"expected {self._total_numel} — model/server mismatch?"
+                        )
+                    flat_params = _bytes_to_tensor(
+                        _read_exact(resp, numel * 4), torch.float32
+                    )
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code != 503 or attempt == self._busy_retries:
+                    raise
+                # Honor Retry-After when the server sends it (it does: "1"),
+                # else fall back to the same delay.
+                try:
+                    delay = float(exc.headers.get("Retry-After", 1.0))
+                except (TypeError, ValueError):
+                    delay = 1.0
+                logger.debug(
+                    "Server busy (503); retrying push in %.1fs (attempt %d/%d)",
+                    delay,
+                    attempt + 1,
+                    self._busy_retries,
+                )
+                time.sleep(min(delay, self._sync_timeout))
 
         return (
             flat_params,

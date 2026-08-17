@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import io
 import json
 import multiprocessing
 import os
@@ -23,9 +24,11 @@ from torchft.async_diloco import (
     AsyncDiLoCo,
     AsyncDiLoCoServer,
     DelayedNesterovOptimizer,
+    _bytes_to_tensor,
     _dequantize_int8,
     _GraceBatch,
     _quantize_int8,
+    _read_exact,
 )
 
 
@@ -211,6 +214,117 @@ class TestAsyncDiLoCoServer(TestCase):
         # /status is unaffected by the sync session cap.
         with urllib.request.urlopen(server.status_address()) as resp:
             self.assertEqual(resp.status, 200)
+
+    def test_read_exact_is_zero_copy_and_byte_identical(self) -> None:
+        """These payloads are whole-model-sized (2.2 GiB fp32 at 0.6B, ~30 GiB at
+        8B), so every extra allocation lands on the parameter server's peak RSS —
+        two workers OOM'd a 32 GiB cloud hub. _read_exact must fill ONE writable
+        buffer that _bytes_to_tensor wraps in place, with the bytes unchanged."""
+        want = torch.arange(64, dtype=torch.float32)
+        raw = want.numpy().tobytes()
+
+        buf = _read_exact(io.BytesIO(raw), len(raw))
+        self.assertIsInstance(buf, bytearray)   # writable => frombuffer won't copy
+        self.assertEqual(bytes(buf), raw)       # byte-identical to the wire
+
+        got = _bytes_to_tensor(buf, torch.float32)
+        self.assertTrue(torch.equal(got, want))
+        # The tensor must ALIAS the buffer, not copy it: mutate the buffer and
+        # the tensor sees it. This is the property that saves the copy.
+        buf[0:4] = b"\x00\x00\x00\x00"
+        self.assertEqual(got[0].item(), 0.0)
+
+    def test_read_exact_handles_chunked_streams_and_short_reads(self) -> None:
+        """A socket delivers a multi-GB body in many chunks; readinto must be
+        driven to completion, and an early EOF must still raise."""
+
+        class _Dribble(io.RawIOBase):
+            """Returns at most 7 bytes per readinto call."""
+
+            def __init__(self, data: bytes) -> None:
+                self._data, self._pos = data, 0
+
+            def readable(self) -> bool:
+                return True
+
+            def readinto(self, b) -> int:  # type: ignore[no-untyped-def]
+                n = min(7, len(b), len(self._data) - self._pos)
+                b[:n] = self._data[self._pos : self._pos + n]
+                self._pos += n
+                return n
+
+        raw = torch.arange(50, dtype=torch.float32).numpy().tobytes()
+        self.assertEqual(bytes(_read_exact(_Dribble(raw), len(raw))), raw)
+
+        with self.assertRaises(IOError):
+            _read_exact(io.BytesIO(raw[:20]), len(raw))
+
+    def test_busy_503_retries_the_push_instead_of_dropping_it(self) -> None:
+        """A session cap is only safe with this retry.
+
+        503 means "all max_sessions slots busy, come back" — not a failure. If it
+        escapes, AsyncDiLoCo._step_post_hook's catch-all drops the push and
+        re-baselines, silently throwing away the window's pseudo-gradient. So the
+        client must wait Retry-After and re-send the SAME push."""
+        model = _make_model()
+        server = AsyncDiLoCoServer(
+            model, optim.SGD(model.parameters(), lr=0.1), port=0, max_sessions=1
+        )
+        self.addCleanup(server.shutdown)
+        worker = _make_model()
+        worker.load_state_dict(model.state_dict())
+        real_urlopen = urllib.request.urlopen
+        calls: Dict[str, int] = {"n": 0}
+
+        with AsyncDiLoCo(
+            server.address(),
+            worker,
+            optim.SGD(worker.parameters(), lr=0.1),
+            sync_every=1,
+            busy_retries=5,
+        ) as ad:
+            # Refuse the first two attempts with a real 503, then let it through.
+            def flaky(request, *args, **kwargs):  # type: ignore[no-untyped-def]
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise urllib.error.HTTPError(
+                        server.address(), 503, "busy",
+                        {"Retry-After": "0"}, None,   # 0 keeps the test fast
+                    )
+                return real_urlopen(request, *args, **kwargs)
+
+            with patch("urllib.request.urlopen", side_effect=flaky):
+                flat, _, revision, applied = ad._session_roundtrip(
+                    1.0, 1.0, torch.zeros(_total_numel(worker))
+                )
+
+        self.assertEqual(calls["n"], 3, "should have retried twice, then succeeded")
+        self.assertTrue(applied, "the retried push must land, not be dropped")
+        self.assertEqual(revision, 1)
+        self.assertEqual(flat.numel(), _total_numel(worker))
+
+    def test_busy_503_gives_up_after_busy_retries(self) -> None:
+        """Bounded, not infinite: once the budget is spent the 503 propagates and
+        the existing drop-and-resync path takes over."""
+        model = _make_model()
+        server = AsyncDiLoCoServer(
+            model, optim.SGD(model.parameters(), lr=0.1), port=0, max_sessions=0
+        )
+        self.addCleanup(server.shutdown)
+        worker = _make_model()
+        # max_sessions=0 refuses EVERY push, including __enter__'s initial pull,
+        # so drive the client directly rather than through the context manager.
+        ad = AsyncDiLoCo.__new__(AsyncDiLoCo)
+        ad._server_address = server.address()
+        ad._sync_timeout = 5.0
+        ad._busy_retries = 2
+        ad._total_numel = _total_numel(worker)
+        ad._param_numels = [p.numel() for p in worker.parameters()]
+        ad._quantize = False
+        ad._baseline_revision = 0
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            ad._session_roundtrip(1.0, 1.0, torch.zeros(_total_numel(worker)))
+        self.assertEqual(ctx.exception.code, 503)
 
     def test_stale_baseline_rejected(self) -> None:
         """A push whose baseline revision is ahead of the server (checkpoint-restore
