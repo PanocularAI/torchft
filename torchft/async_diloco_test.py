@@ -930,3 +930,285 @@ class TestMultiProcess(TestCase):
         self.assertEqual(len(worker_ids), 2, "worker ids collided across processes")
         # Both workers pushed at least once.
         self.assertGreaterEqual(server._revision, 2)
+
+
+# --------------------------------------------------------------------------- #
+# Replica mode (replica_pg): one PS session per multi-rank, DTensor-sharded
+# replica. Two gloo CPU processes shard a seeded model Shard(0) — with an
+# UNEVEN leading dim, so shard sizes differ per rank — and must behave as ONE
+# parameter-server worker (rank-0 session; broadcast-adopted params).
+# --------------------------------------------------------------------------- #
+import torch.distributed as pt_dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
+
+from torchft.async_diloco import _local_shard_slices
+
+_REPLICA_D_IN, _REPLICA_D_OUT = 4, 5  # 5 rows over 2 ranks: 3/2, uneven
+
+
+def _replica_base_model(seed: int = 1234) -> nn.Module:
+    torch.manual_seed(seed)
+    return nn.Linear(_REPLICA_D_IN, _REPLICA_D_OUT)
+
+
+def _shard_params_(model: nn.Module) -> None:
+    """Replace every parameter with its Shard(0) DTensor over the WORLD mesh
+    (every rank passes the identical seeded full tensor)."""
+    mesh = init_device_mesh("cpu", (pt_dist.get_world_size(),))
+    for mod in model.modules():
+        for name, p in list(mod.named_parameters(recurse=False)):
+            setattr(
+                mod,
+                name,
+                nn.Parameter(distribute_tensor(p.detach(), mesh, [Shard(0)])),
+            )
+
+
+def _drive_windows(
+    model: nn.Module, opt: optim.Optimizer, windows: int, sync_every: int
+) -> None:
+    """Deterministic inner steps: grad == ones everywhere, so replica and
+    single-process reference runs push identical pseudo-gradients."""
+    for _ in range(windows * sync_every):
+        opt.zero_grad()
+        for p in model.parameters():
+            p.grad = torch.ones_like(p)
+        opt.step()
+
+
+def _init_replica_dist(rank: int, dist_port: int) -> None:
+    pt_dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{dist_port}",
+        rank=rank,
+        world_size=2,
+    )
+
+
+def _replica_sync_child(
+    rank: int, dist_port: int, server_addr: str, hb_addr: str
+) -> None:
+    """Child for test_two_rank_replica_syncs_shards: 2 windows over uneven
+    Shard(0) params, then per-rank slice equality against the server."""
+    _init_replica_dist(rank, dist_port)
+    try:
+        model = _replica_base_model()
+        _shard_params_(model)
+        opt = optim.SGD(model.parameters(), lr=0.1)
+        client = AsyncDiLoCo(
+            server_addr,
+            model,
+            opt,
+            sync_every=3,
+            heartbeat_address=hb_addr,
+            replica_pg=pt_dist.group.WORLD,
+        )
+        # Only the lead may carry a worker identity (a follower heartbeat
+        # would register the replica twice).
+        assert (client._heartbeat_url is not None) == (rank == 0), rank
+        with client:
+            _drive_windows(model, opt, windows=2, sync_every=3)
+        assert client._baseline_revision == (2 if rank == 0 else 0), (
+            rank,
+            client._baseline_revision,
+        )
+        # Every rank's shard must equal its slice of the server's params.
+        server_params, _, revision, _ = push_pull(
+            server_addr, model, full_sync=False
+        )
+        assert revision == 2, revision
+        for name, p in model.named_parameters():
+            expect = server_params[name][_local_shard_slices(p)]
+            assert torch.equal(p.to_local(), expect), (rank, name)
+    finally:
+        pt_dist.destroy_process_group()
+
+
+def _replica_dylu_child(
+    rank: int, dist_port: int, server_addr: str
+) -> None:
+    """Child for test_dylu_reaches_every_rank: the server's new_steps must
+    land on BOTH ranks (via the outcome broadcast), or window lengths drift
+    and the next collective deadlocks."""
+    _init_replica_dist(rank, dist_port)
+    try:
+        model = _replica_base_model()
+        _shard_params_(model)
+        opt = optim.SGD(model.parameters(), lr=0.1)
+        client = AsyncDiLoCo(
+            server_addr, model, opt, sync_every=5,
+            replica_pg=pt_dist.group.WORLD,
+        )
+        with client:
+            _drive_windows(model, opt, windows=1, sync_every=5)
+        assert client._sync_every == 10, (rank, client._sync_every)
+    finally:
+        pt_dist.destroy_process_group()
+
+
+def _replica_failure_child(
+    rank: int, dist_port: int, server_addr: str, flag_path: str
+) -> None:
+    """Child for test_server_death_keeps_ranks_lockstep: after the server
+    dies, every boundary must still complete on BOTH ranks (FAIL/SKIP words
+    keep them in lockstep) with training continuing locally."""
+    _init_replica_dist(rank, dist_port)
+    try:
+        model = _replica_base_model()
+        _shard_params_(model)
+        opt = optim.SGD(model.parameters(), lr=0.1)
+        client = AsyncDiLoCo(
+            server_addr, model, opt, sync_every=2,
+            replica_pg=pt_dist.group.WORLD,
+        )
+        with client:
+            _drive_windows(model, opt, windows=1, sync_every=2)  # healthy
+            pt_dist.barrier()
+            # parent shuts the server down, then touches the flag file
+            deadline = time.monotonic() + 30
+            while not os.path.exists(flag_path):
+                assert time.monotonic() < deadline, "parent never flagged"
+                time.sleep(0.05)
+            before = {
+                n: p.to_local().clone() for n, p in model.named_parameters()
+            }
+            # failed sync boundary + a resync-attempt boundary: both must
+            # return on both ranks rather than hang
+            _drive_windows(model, opt, windows=2, sync_every=2)
+            if rank == 0:
+                assert client._pending_resync, "lead should be in resync"
+            assert client._baseline_revision == (1 if rank == 0 else 0)
+            # no adopt happened: params are the locally-trained values
+            for n, p in model.named_parameters():
+                lr_drift = 0.1 * 2 * 2  # lr * steps of two windows
+                expect = before[n] - lr_drift
+                assert torch.allclose(p.to_local(), expect), (rank, n)
+    finally:
+        pt_dist.destroy_process_group()
+
+
+def _replica_blend_child(
+    rank: int, dist_port: int, server_addr: str
+) -> None:
+    """Child for test_blend_alpha_replica: fragment_update_alpha lerps each
+    rank's OWN pre-adopt shard."""
+    _init_replica_dist(rank, dist_port)
+    try:
+        model = _replica_base_model()
+        _shard_params_(model)
+        init = {n: p.to_local().clone() for n, p in model.named_parameters()}
+        opt = optim.SGD(model.parameters(), lr=0.1)
+        alpha = 0.5
+        client = AsyncDiLoCo(
+            server_addr, model, opt, sync_every=1,
+            fragment_update_alpha=alpha,
+            replica_pg=pt_dist.group.WORLD,
+        )
+        with client:
+            _drive_windows(model, opt, windows=1, sync_every=1)
+        server_params, _, _, _ = push_pull(server_addr, model, full_sync=False)
+        for n, p in model.named_parameters():
+            local_pre = init[n] - 0.1  # one ones-grad SGD step
+            expect = torch.lerp(
+                server_params[n][_local_shard_slices(p)], local_pre, alpha
+            )
+            assert torch.allclose(p.to_local(), expect), (rank, n)
+    finally:
+        pt_dist.destroy_process_group()
+
+
+class TestReplicaMode(TestCase):
+    def _free_port(self) -> int:
+        import socket as _socket
+
+        with _socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def _spawn(self, fn, *args) -> None:
+        torch.multiprocessing.spawn(
+            fn, args=(self._free_port(), *args), nprocs=2, join=True
+        )
+
+    def _server(self, lr: float = 0.5, **kw) -> AsyncDiLoCoServer:
+        model = _replica_base_model()
+        return AsyncDiLoCoServer(
+            model, optim.SGD(model.parameters(), lr=lr), port=0, **kw
+        )
+
+    def test_two_rank_replica_syncs_shards(self) -> None:
+        server = self._server(heartbeat_timeout=5.0)
+        try:
+            self._spawn(
+                _replica_sync_child, server.address(),
+                server.heartbeat_address(),
+            )
+            self.assertEqual(server.status()["revision"], 2)
+            # Equivalence: a single-process worker over the SAME seeded model
+            # and grad schedule must leave an identical server.
+            ref_server = self._server()
+            try:
+                ref_model = _replica_base_model()
+                ref_opt = optim.SGD(ref_model.parameters(), lr=0.1)
+                with AsyncDiLoCo(
+                    ref_server.address(), ref_model, ref_opt, sync_every=3
+                ):
+                    _drive_windows(ref_model, ref_opt, windows=2, sync_every=3)
+                got, _, _, _ = push_pull(
+                    server.address(), _replica_base_model(), full_sync=False
+                )
+                want, _, _, _ = push_pull(
+                    ref_server.address(), _replica_base_model(),
+                    full_sync=False,
+                )
+                for name in got:
+                    torch.testing.assert_close(got[name], want[name])
+            finally:
+                ref_server.shutdown()
+        finally:
+            server.shutdown()
+
+    def test_dylu_reaches_every_rank(self) -> None:
+        server = self._server(dylu_H=10)
+        try:
+            self._spawn(_replica_dylu_child, server.address())
+        finally:
+            server.shutdown()
+
+    def test_server_death_keeps_ranks_lockstep(self) -> None:
+        server = self._server()
+        flag = tempfile.mktemp(prefix="asyncdiloco-down-")
+        try:
+            procs_err: list = []
+
+            def _run() -> None:
+                try:
+                    self._spawn(
+                        _replica_failure_child, server.address(), flag
+                    )
+                except Exception as e:  # surfaced after join
+                    procs_err.append(e)
+
+            t = threading.Thread(target=_run)
+            t.start()
+            deadline = time.monotonic() + 30
+            while server.status()["revision"] < 1:
+                self.assertLess(time.monotonic(), deadline, "no first sync")
+                time.sleep(0.05)
+            server.shutdown()
+            with open(flag, "w"):
+                pass
+            t.join(timeout=90)
+            self.assertFalse(t.is_alive(), "replica hung after server death")
+            self.assertEqual(procs_err, [])
+        finally:
+            if os.path.exists(flag):
+                os.unlink(flag)
+
+    def test_blend_alpha_replica(self) -> None:
+        server = self._server()
+        try:
+            self._spawn(_replica_blend_child, server.address())
+        finally:
+            server.shutdown()

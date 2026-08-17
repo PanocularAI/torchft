@@ -29,8 +29,10 @@ from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Type
 from urllib.parse import parse_qs, urlparse
 
 import torch
+import torch.distributed as dist
 import torch.profiler
 from torch import nn, optim
+from torch.distributed.tensor import DTensor
 
 from torchft.http import _IPv6HTTPServer
 from torchft.parameter_server import _resolve_advertise_host
@@ -38,6 +40,42 @@ from torchft.parameter_server import _resolve_advertise_host
 logger: logging.Logger = logging.getLogger(__name__)
 
 _MAX_HEADER_BYTES: int = 1 << 16
+
+
+def _full_value(p: torch.Tensor) -> torch.Tensor:
+    """The parameter's value as ONE whole tensor.
+
+    Plain tensors and whole/replicated DTensors return the local tensor
+    (storage-shared, no communication). A sharded DTensor is materialized via
+    ``full_tensor()`` — a collective over the parameter's mesh, so in replica
+    mode every rank must reach this call for every parameter in the same
+    order (they do: ``named_parameters()`` order is fixed per model).
+    """
+    if isinstance(p, DTensor):
+        local = p.to_local()
+        if tuple(local.shape) == tuple(p.shape):
+            return local
+        return p.full_tensor()
+    return p
+
+
+def _local_shard_slices(p: "DTensor") -> Tuple[slice, ...]:
+    """Index of this rank's shard inside the parameter's GLOBAL tensor.
+
+    Uses the DTensor placement metadata (never numel/world arithmetic: FSDP2
+    pads nothing here, and uneven dims give ranks different shard sizes).
+    """
+    # Private torch API (present in the pinned 2.13 nightlies); flagged in the
+    # update-submodules ledger. The public fallback would be reconstructing
+    # offsets from p.placements by hand.
+    from torch.distributed.tensor._utils import (
+        compute_local_shape_and_global_offset,
+    )
+
+    shape, offset = compute_local_shape_and_global_offset(
+        p.shape, p.device_mesh, p.placements
+    )
+    return tuple(slice(o, o + s) for o, s in zip(offset, shape))
 
 
 def _read_exact(stream: BinaryIO, nbytes: int) -> bytes:
@@ -992,6 +1030,7 @@ class AsyncDiLoCo:
         reset_inner_state: bool = False,
         resync_backoff_max: float = 60.0,
         sync_timeout: float = 60.0,
+        replica_pg: Optional[dist.ProcessGroup] = None,
     ) -> None:
         """
         Args:
@@ -1030,6 +1069,21 @@ class AsyncDiLoCo:
             sync_timeout: Socket timeout in seconds for each sync request.
                 Must exceed the server's ``grace_period`` (the server holds
                 the response while aggregating the batch). Defaults to 60 s.
+            replica_pg: REPLICA MODE — a (gloo) process group spanning every
+                rank of one multi-GPU/multi-node replica whose model may be
+                DTensor-sharded (FSDP/TP/2-D; never pipeline-split — PP
+                changes ``named_parameters()`` itself). The replica then
+                behaves as ONE parameter-server worker: rank 0 of the group
+                owns the HTTP session, the heartbeat identity, and the
+                full-model CPU backup; window boundaries gather full
+                parameter values (``DTensor.full_tensor()``), rank 0 does the
+                roundtrip, broadcasts a status word all control flow keys off
+                (so ranks can never diverge on adopt/resync decisions), then
+                broadcasts the pulled params parameter-by-parameter for each
+                rank to slice its own shard from. Every rank of the replica
+                must construct and drive this object in lockstep (same
+                ``sync_every``, same step cadence). ``None`` (default) is the
+                single-process behavior, byte-for-byte.
         """
         self._server_address = server_address
         self._model = model
@@ -1042,17 +1096,42 @@ class AsyncDiLoCo:
         self._local_step = 0
         self._hooks: List[Any] = []
         self._window_start: float = 0.0
+        # Replica mode (see the docstring): rank 0 of `replica_pg` is the
+        # replica's LEAD — the only rank that speaks to the server.
+        self._replica_pg = replica_pg
+        self._is_lead: bool = (
+            replica_pg is None or dist.get_rank(replica_pg) == 0
+        )
+        self._lead_rank: Optional[int] = (
+            None if replica_pg is None else dist.get_global_rank(replica_pg, 0)
+        )
         backup = backup_device or torch.device("cpu")
+        # The wire layout: DTensor .shape/.numel() are the GLOBAL shape, so
+        # these match the server's own named_parameters() layout even when
+        # this rank only holds a shard.
+        self._param_names: List[str] = [
+            name for name, _ in model.named_parameters()
+        ]
+        self._param_numels: List[int] = [
+            p.numel() for _, p in model.named_parameters()
+        ]
+        self._total_numel: int = sum(self._param_numels)
+        # Full-model backup of the last-adopted global params: pseudo-gradients
+        # are computed against it. Only the lead ever reads it, so followers
+        # skip it entirely (a sharded rank couldn't cheaply fill it anyway).
+        # Its CONTENT before the first pull is never read — __enter__ adopts
+        # the server's params into it — so replica mode allocates empty; the
+        # single-process path keeps the value snapshot for drivers that skip
+        # __enter__ (e.g. the decentralized_rl HeLoCoRLClient pattern).
         self._global_params: Dict[str, torch.Tensor] = {}
         with torch.no_grad():
             for name, p in model.named_parameters():
-                self._global_params[name] = p.detach().to(backup).clone()
-        # Explicit ordered list so push/pull loops always match the server's order
-        self._param_names: List[str] = list(self._global_params.keys())
-        self._param_numels: List[int] = [
-            t.numel() for t in self._global_params.values()
-        ]
-        self._total_numel: int = sum(self._param_numels)
+                if replica_pg is None:
+                    self._global_params[name] = p.detach().to(backup).clone()
+                elif self._is_lead:
+                    self._global_params[name] = torch.empty(
+                        tuple(p.shape), dtype=p.dtype, device=backup
+                    )
 
         # Revision of the global model our params are based on (see
         # AsyncDiLoCoServer: lets the server detect pushes computed against a
@@ -1075,7 +1154,10 @@ class AsyncDiLoCo:
         # process must register under a distinct id, hostname-prefixed for
         # readable logs.
         self._worker_id: str = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
-        if heartbeat_address is not None:
+        # Replica mode: the LEAD is the replica's one worker identity — a
+        # follower heartbeat would register the replica K times, and DyLU /
+        # grace batching / rho=1/sqrt(K) all assume workers are replicas.
+        if heartbeat_address is not None and self._is_lead:
             self._heartbeat_url: Optional[str] = (
                 f"{heartbeat_address}?worker_id={self._worker_id}"
             )
@@ -1153,7 +1235,9 @@ class AsyncDiLoCo:
         if self._local_step < self._sync_every:
             return
 
-        if self._pending_resync:
+        if self._replica_pg is not None:
+            self._boundary_replica()
+        elif self._pending_resync:
             # Server was unreachable on a previous boundary: the dropped
             # push's window is gone, so just try to re-baseline (pull-only)
             # with backoff and keep training locally in the meantime.
@@ -1201,6 +1285,234 @@ class AsyncDiLoCo:
         logger.info(
             "AsyncDiLoCo resynced to server revision %d", self._baseline_revision
         )
+
+    # ------------------------------------------------------------------ #
+    # Replica mode (replica_pg): one PS session per multi-rank replica    #
+    # ------------------------------------------------------------------ #
+
+    # Broadcast words (lead -> followers). Action picks the boundary branch;
+    # outcome picks the post-HTTP branch.
+    _ACT_SKIP, _ACT_SYNC, _ACT_RESYNC = 0, 1, 2
+    _OUT_FAIL, _OUT_ADOPT, _OUT_ADOPT_BLEND = 0, 1, 2
+
+    def _bcast_words(self, words: List[int]) -> List[int]:
+        """Broadcast small control integers from the lead. Every branch the
+        replica takes around an HTTP attempt keys off these words — per-rank
+        decisions (clocks, exceptions the followers never saw) would pick
+        different branches and deadlock the next collective."""
+        t = torch.tensor(
+            words if self._is_lead else [0] * len(words), dtype=torch.int64
+        )
+        dist.broadcast(t, src=self._lead_rank, group=self._replica_pg)
+        return t.tolist()
+
+    def _boundary_replica(self) -> None:
+        """One window boundary in replica mode: the lead decides the action
+        (its resync clock is the replica's), everyone follows the broadcast."""
+        act = self._ACT_SKIP
+        if self._is_lead:
+            if self._pending_resync:
+                act = (
+                    self._ACT_RESYNC
+                    if time.monotonic() >= self._resync_at
+                    else self._ACT_SKIP
+                )
+            else:
+                act = self._ACT_SYNC
+        (act,) = self._bcast_words([act])
+        if act == self._ACT_SYNC:
+            self._sync_replica()
+        elif act == self._ACT_RESYNC:
+            self._resync_replica()
+
+    @torch.profiler.record_function("async_diloco.sync_replica")
+    def _sync_replica(self) -> None:
+        """Replica-mode :meth:`_sync`: gather full values -> lead HTTP ->
+        outcome broadcast -> adopt. Failure semantics mirror the
+        single-process path (drop the push, pull-only resync later)."""
+        need_local = self._fragment_update_alpha > 0.0
+        blend_local: Dict[str, torch.Tensor] = {}
+        grad_chunks: List[torch.Tensor] = []
+        with torch.no_grad():
+            for name, p in self._model.named_parameters():
+                if need_local:
+                    local = p.to_local() if isinstance(p, DTensor) else p
+                    # Per-rank snapshot of the rank's OWN slice: the blend
+                    # lerps each rank's post-adopt shard toward it.
+                    blend_local[name] = local.detach().cpu().clone()
+                # Collective for sharded params — every rank participates,
+                # only the lead consumes the value (one param at a time, so
+                # the GPU transient is the largest parameter, not the model).
+                full = _full_value(p)
+                if self._is_lead:
+                    grad_chunks.append(
+                        (self._global_params[name] - full.detach().cpu())
+                        .reshape(-1)
+                        .float()
+                    )
+                del full
+
+        outcome, new_steps, revision = self._OUT_FAIL, 0, 0
+        flat_params: Optional[torch.Tensor] = None
+        if self._is_lead:
+            logger.info(
+                f"AsyncDiLoCo syncing after {self._sync_every} inner steps"
+            )
+            if self._skip_speed_report:
+                speed = 0.0
+                self._skip_speed_report = False
+            else:
+                elapsed = time.monotonic() - self._window_start
+                speed = self._local_step / elapsed if elapsed > 0 else 0.0
+            try:
+                flat_params, new_steps, revision, applied = (
+                    self._session_roundtrip(
+                        flag=1.0,
+                        speed=speed,
+                        flat_grads=torch.cat(grad_chunks),
+                    )
+                )
+                if applied:
+                    outcome = (
+                        self._OUT_ADOPT_BLEND if need_local else self._OUT_ADOPT
+                    )
+                else:
+                    # Stale baseline (e.g. server checkpoint restore): the
+                    # response is a pure re-baseline, never blended.
+                    logger.warning(
+                        "AsyncDiLoCo push rejected by server (baseline "
+                        "revision %d); re-baselining to server revision %d",
+                        self._baseline_revision,
+                        revision,
+                    )
+                    self._skip_speed_report = True
+                    outcome = self._OUT_ADOPT
+            except Exception as exc:
+                logger.warning(
+                    "AsyncDiLoCo sync failed; dropping push and continuing "
+                    "local training (will resync): %s",
+                    exc,
+                )
+                self._pending_resync = True
+                self._resync_backoff = 1.0
+                self._resync_at = time.monotonic()
+        outcome, new_steps = self._bcast_words([outcome, new_steps])
+        if outcome != self._OUT_FAIL:
+            self._adopt_replica(
+                flat_params,
+                revision,
+                new_steps,
+                blend_local if outcome == self._OUT_ADOPT_BLEND else None,
+            )
+
+    def _resync_replica(self) -> None:
+        """Replica-mode :meth:`_try_resync`: pull-only re-baseline; backoff
+        state lives on the lead alone."""
+        outcome, new_steps, revision = self._OUT_FAIL, 0, 0
+        flat_params: Optional[torch.Tensor] = None
+        if self._is_lead:
+            try:
+                flat_params, new_steps, revision, _ = self._session_roundtrip(
+                    flag=0.0, speed=0.0, flat_grads=None
+                )
+                outcome = self._OUT_ADOPT
+            except Exception as exc:
+                self._resync_at = time.monotonic() + self._resync_backoff
+                self._resync_backoff = min(
+                    self._resync_backoff * 2, self._resync_backoff_max
+                )
+                logger.warning(
+                    "AsyncDiLoCo resync failed (next attempt in %.0fs): %s",
+                    self._resync_at - time.monotonic(),
+                    exc,
+                )
+        outcome, new_steps = self._bcast_words([outcome, new_steps])
+        if outcome == self._OUT_FAIL:
+            return
+        self._adopt_replica(flat_params, revision, new_steps, None)
+        if self._is_lead:
+            self._pending_resync = False
+            self._resync_backoff = 1.0
+            self._skip_speed_report = True
+            logger.info("AsyncDiLoCo resynced to server revision %d", revision)
+
+    def _adopt_replica(
+        self,
+        flat_params: Optional[torch.Tensor],
+        revision: int,
+        new_steps: int,
+        blend_local: Optional[Dict[str, torch.Tensor]],
+    ) -> None:
+        """Replica-mode :meth:`_adopt_global`: broadcast the pulled fp32
+        params parameter-by-parameter (bounded follower memory — one full
+        parameter at a time, never the flat model) and install each rank's
+        own slice in place, sliced by the DTensor placement offsets."""
+        with torch.no_grad():
+            offset = 0
+            for (name, p), numel in zip(
+                self._model.named_parameters(), self._param_numels
+            ):
+                shape = tuple(p.shape)
+                if self._is_lead:
+                    full = flat_params[offset : offset + numel].view(shape)
+                else:
+                    full = torch.empty(shape, dtype=torch.float32)
+                offset += numel
+                dist.broadcast(
+                    full, src=self._lead_rank, group=self._replica_pg
+                )
+                if isinstance(p, DTensor):
+                    # to_local() shares storage: writes land in the model.
+                    local = p.to_local()
+                    chunk = (
+                        full
+                        if tuple(local.shape) == shape
+                        else full[_local_shard_slices(p)]
+                    )
+                else:
+                    local, chunk = p.data, full
+                local.copy_(chunk)  # device move + dtype cast in one hop
+                if blend_local is not None:
+                    local.lerp_(
+                        blend_local[name].to(local.device, local.dtype),
+                        self._fragment_update_alpha,
+                    )
+                if self._is_lead:
+                    self._global_params[name].copy_(full)
+                del full
+        if self._is_lead:
+            self._baseline_revision = revision
+        if self._reset_inner_state:
+            self._inner_optimizer.state.clear()
+        # DyLU: new_steps arrives via the outcome broadcast, so every rank
+        # moves to the same window length on the same boundary.
+        if new_steps > 0 and new_steps != self._sync_every:
+            logger.info(
+                f"AsyncDiLoCo DyLU: sync_every updated {self._sync_every} → {new_steps}"
+            )
+            self._sync_every = new_steps
+
+    def _pull_global_replica(self) -> None:
+        """Replica-mode pull: failure raises on EVERY rank (so __enter__
+        propagates consistently instead of stranding followers in a
+        broadcast that will never come)."""
+        outcome, new_steps, revision = self._OUT_FAIL, 0, 0
+        flat_params: Optional[torch.Tensor] = None
+        err: Optional[Exception] = None
+        if self._is_lead:
+            try:
+                flat_params, new_steps, revision, _ = self._session_roundtrip(
+                    flag=0.0, speed=0.0, flat_grads=None
+                )
+                outcome = self._OUT_ADOPT
+            except Exception as exc:
+                err = exc
+        outcome, new_steps = self._bcast_words([outcome, new_steps])
+        if outcome == self._OUT_FAIL:
+            raise RuntimeError(
+                "AsyncDiLoCo pull failed on the replica lead"
+            ) from err
+        self._adopt_replica(flat_params, revision, new_steps, None)
 
     # ------------------------------------------------------------------ #
     # Session plumbing                                                    #
@@ -1292,6 +1604,9 @@ class AsyncDiLoCo:
 
     def _pull_global(self) -> None:
         """Pull current global params (flag=0) and adopt them wholesale."""
+        if self._replica_pg is not None:
+            self._pull_global_replica()
+            return
         flat_params, new_steps, revision, _ = self._session_roundtrip(
             flag=0.0, speed=0.0, flat_grads=None
         )
