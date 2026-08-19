@@ -414,7 +414,7 @@ class AsyncDiLoCoServer:
         bind_host: str = "",
         advertise_host: Optional[str] = None,
         max_sessions: int = 128,
-        request_timeout: float = 60.0,
+        request_timeout: float = 600.0,
         dylu_H: int = 0,
         dylu_timeout: float = 300.0,
         dylu_percentile: float = 0.9,
@@ -444,6 +444,14 @@ class AsyncDiLoCoServer:
                 exhaust server threads/RAM.
             request_timeout: socket timeout in seconds for each sync request;
                 a dead peer occupies a handler thread for at most this long.
+                This bounds a STALL, not the transfer: it must cover the
+                longest the peer can go without moving a byte, which on a
+                shared hub is a GIL-starvation window, not a bandwidth
+                figure. A 4B model syncs ~21 GB per roundtrip (4.4 GB int8
+                up, 16.3 GB fp32 down) at 350-500 MB/s while the relay
+                fans out 8.8 GB checkpoints from the same process -- the
+                old 60 s default timed out BOTH ends mid-body and killed
+                the run. Defaults to 600 s.
             dylu_H: Maximum local steps H for Dynamic Local Updates (DyLU).
                 Per the paper (Eq. 6), each worker w is assigned
                 ``floor(v(w) / v_ref * H)`` steps (capped at H) so slower
@@ -1359,7 +1367,7 @@ class AsyncDiLoCo:
         should_quantize: bool = False,
         reset_inner_state: bool = False,
         resync_backoff_max: float = 60.0,
-        sync_timeout: float = 60.0,
+        sync_timeout: float = 600.0,
         busy_retries: int = 10,
         replica_pg: Optional[dist.ProcessGroup] = None,
         num_fragments: int = 1,
@@ -1400,7 +1408,11 @@ class AsyncDiLoCo:
                 between resync attempts while the server is unreachable.
             sync_timeout: Socket timeout in seconds for each sync request.
                 Must exceed the server's ``grace_period`` (the server holds
-                the response while aggregating the batch). Defaults to 60 s.
+                the response while aggregating the batch) AND the longest
+                the server can go without writing a byte -- see
+                ``AsyncDiLoCoServer.request_timeout`` for why that is a
+                GIL-starvation window on a shared hub, not a bandwidth
+                figure. Defaults to 600 s.
             busy_retries: How many times to re-send a push the server refused
                 with 503 (all ``max_sessions`` slots busy), waiting the
                 advertised ``Retry-After`` between attempts. Retrying is what
@@ -1574,7 +1586,9 @@ class AsyncDiLoCo:
         # same cost as any dropped push.
         inflight, self._inflight = self._inflight, None
         if inflight is not None and inflight.thread is not None:
-            inflight.thread.join(timeout=self._sync_timeout)
+            # Capped independently of _sync_timeout: that bounds a stall
+            # mid-transfer (minutes), this is a discard on the way out.
+            inflight.thread.join(timeout=min(self._sync_timeout, 60.0))
         for hook in self._hooks:
             hook.remove()
         self._hooks.clear()
