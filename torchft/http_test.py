@@ -98,5 +98,34 @@ class AddressFamilyTest(unittest.TestCase):
             server.server_close()
 
 
+class ManagerBindAddressTest(unittest.TestCase):
+    """`Manager` hands its bind string to the RUST ManagerServer, so an IPv6 wildcard
+    on an IPv6-less host fails as `RuntimeError: ... (os error 97)`. torchft/manager.py
+    imports torch, which is not always available where these unit tests run, so pin the
+    exact expression from the source rather than importing the module.
+    """
+
+    EXPECTED = 'bind = f"[::]:{port}" if _ipv6_supported() else f"0.0.0.0:{port}"'
+
+    def test_manager_chooses_the_wildcard_by_ipv6_support(self) -> None:
+        manager_py = pathlib.Path(__file__).with_name("manager.py").read_text()
+        self.assertIn(self.EXPECTED, manager_py,
+                      "manager.py must pick its bind wildcard via _ipv6_supported(); a "
+                      "hardcoded [::] breaks every host with IPv6 disabled")
+
+    def test_both_wildcards_are_bindable_shapes(self) -> None:
+        """Sanity-check the two strings the line above can produce: the one matching
+        this host must actually bind."""
+        module = _load_http_module()
+        family = module._IPv6HTTPServer.address_family
+        wildcard = "" if family == socket.AF_INET6 else "0.0.0.0"
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            sock.bind((wildcard, 0))
+            self.assertGreater(sock.getsockname()[1], 0)
+        finally:
+            sock.close()
+
+
 if __name__ == "__main__":
     unittest.main()
