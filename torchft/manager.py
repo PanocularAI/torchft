@@ -56,6 +56,7 @@ from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
 from torchft.checkpointing.pg_transport import PGTransport
 from torchft.checkpointing._rwlock import RWLock
+from torchft.http import _ipv6_supported
 from torchft.futures import future_timeout
 from torchft.utils import get_stream_context, synchronize
 from torchft.work import _DummyWork
@@ -313,7 +314,14 @@ class Manager:
             if port is None:
                 port = int(os.environ.get(MANAGER_PORT_ENV, 0))
 
-            bind = f"[::]:{port}"
+            # Panocular: the IPv6 wildcard only where IPv6 exists. This string goes
+            # to the Rust ManagerServer's TcpListener, so on a host without IPv6 it
+            # failed as `RuntimeError: Address family not supported by protocol
+            # (os error 97)` while constructing Manager -- before step 1. HPC compute
+            # nodes commonly disable IPv6 (TU Darmstadt lcluster13: login nodes have
+            # it, GPU nodes do not). `[::]` also serves v4-mapped clients on a
+            # dual-stack host, so preferring it keeps existing behavior.
+            bind = f"[::]:{port}" if _ipv6_supported() else f"0.0.0.0:{port}"
             lighthouse_addr = lighthouse_addr or os.environ["TORCHFT_LIGHTHOUSE"]
 
             # We need a unique identifier in the case that a worker restarts quickly and
