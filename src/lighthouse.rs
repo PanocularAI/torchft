@@ -380,6 +380,13 @@ impl Lighthouse {
                 }),
             )
             .route(
+                "/status.json",
+                get({
+                    let self_clone = self.clone();
+                    move || async { self_clone.get_status_json().await }
+                }),
+            )
+            .route(
                 "/replica/:replica_id/kill",
                 post({
                     let self_clone = self.clone();
@@ -449,6 +456,31 @@ impl Lighthouse {
             }
         };
         Html(template.render().unwrap())
+    }
+
+    /// Machine-readable twin of `/status`, for a supervisor that needs to know
+    /// whether a quorum has actually formed rather than inferring it from a
+    /// trainer's stdout. Numbers only: the free-text quorum status would have to
+    /// be JSON-escaped, and no caller needs it.
+    async fn get_status_json(self: Arc<Self>) -> impl IntoResponse {
+        let (quorum_id, num_participants, max_step) = {
+            let state = self.state.lock().await;
+            let (max_step, num_participants) = match &state.prev_quorum {
+                Some(quorum) => (
+                    quorum.participants.iter().map(|p| p.step).max().unwrap_or(-1),
+                    quorum.participants.len() as i64,
+                ),
+                None => (-1, -1),
+            };
+            (state.quorum_id, num_participants, max_step)
+        };
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"quorum_id\":{},\"num_participants\":{},\"max_step\":{}}}",
+                quorum_id, num_participants, max_step
+            ),
+        )
     }
 
     async fn kill(self: Arc<Self>, Path(replica_id): Path<String>) -> Result<(), AppError> {
