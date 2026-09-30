@@ -147,6 +147,7 @@ class DiLoCoTest(TestCase):
 
         manager = create_manager()
         manager._use_async_quorum = False
+        manager._rank0_synchronization_only = False
         with DiLoCo(
             manager, [model], inner_optimizer, outer_optimizer, sync_every=2
         ) as diloco:
@@ -204,6 +205,7 @@ class DiLoCoTest(TestCase):
 
         manager = create_manager()
         manager._use_async_quorum = False
+        manager._rank0_synchronization_only = False
         manager.should_commit.return_value = True
 
         with DiLoCo(
@@ -243,6 +245,7 @@ class DiLoCoTest(TestCase):
 
         manager = create_autospec(Manager)
         manager._use_async_quorum = False
+        manager._rank0_synchronization_only = False
         manager.should_commit.return_value = True
 
         # Define fake allreduce: multiplies buffer by 2
@@ -283,6 +286,7 @@ class DiLoCoTest(TestCase):
 
         manager = create_autospec(Manager)
         manager._use_async_quorum = False
+        manager._rank0_synchronization_only = False
         manager.should_commit.return_value = True
 
         # Define fake allreduce: multiplies buffer by 2

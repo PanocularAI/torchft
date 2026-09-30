@@ -523,6 +523,7 @@ class Manager:
                 f"got exception in all reduce -- skipping remaining: {e}"
             )
             self.report_error(e)
+            return _DummyWork(tensor)
 
     @torch.profiler.record_function("torchft::manager::_allreduce_cpu")
     def _allreduce_cpu(
@@ -591,6 +592,7 @@ class Manager:
                 f"got exception in all reduce -- skipping remaining: {e}"
             )
             self.report_error(e)
+            return _DummyWork(tensor)
 
     @torch.profiler.record_function("torchft::manager::_allreduce_rank0")
     def _allreduce_rank0(
