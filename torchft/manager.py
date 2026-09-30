@@ -33,7 +33,6 @@ import traceback
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from datetime import timedelta
 from enum import Enum
 from typing import (
@@ -524,6 +523,7 @@ class Manager:
                 f"got exception in all reduce -- skipping remaining: {e}"
             )
             self.report_error(e)
+            return _DummyWork(tensor)
 
     @torch.profiler.record_function("torchft::manager::_allreduce_cpu")
     def _allreduce_cpu(
@@ -592,6 +592,7 @@ class Manager:
                 f"got exception in all reduce -- skipping remaining: {e}"
             )
             self.report_error(e)
+            return _DummyWork(tensor)
 
     @torch.profiler.record_function("torchft::manager::_allreduce_rank0")
     def _allreduce_rank0(
@@ -1746,18 +1747,21 @@ class _ManagedWork(dist._Work):
 
         is_future_wrapped = False
         while managed_fut._next:
-
+            # Bind the node as a default argument: the loop rebinds `managed_fut`,
+            # so a callback that runs after the loop (e.g. when the future completes
+            # on another thread) would otherwise see the tail node instead.
             def callback(
                 fut: torch.futures.Future[object],
+                node: _ManagedFuture[object] = managed_fut,
             ) -> object:
-                nonlocal managed_fut, value
+                nonlocal value
                 # change the stream to avoid making the callback stream
                 # dependent on process group stream running the allreduce
                 with get_stream_context(self._stream):
                     # Setup stream dependency
                     fut.wait()
-                    assert managed_fut._callback
-                    value = managed_fut._callback(
+                    assert node._callback
+                    value = node._callback(
                         _SimpleFuture(value),
                     )
                     return value
